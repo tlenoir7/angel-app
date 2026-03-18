@@ -11,7 +11,6 @@
   "dependencies": {
     "expo": "^55.0.6",
     "expo-audio": "~55.0.9",
-    "expo-av": "^16.0.8",
     "expo-constants": "~55.0.7",
     "expo-dev-client": "~55.0.17",
     "expo-device": "~55.0.9",
