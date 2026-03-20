@@ -476,15 +476,20 @@ export default function App() {
         </TouchableOpacity>
       </View>
 
-      <Animated.View
-        style={[
-          styles.pager,
-          {
-            width: layoutWidth ? layoutWidth * 2 : '200%',
-            transform: [{ translateX }],
-          },
-        ]}
+      <KeyboardAvoidingView
+        style={styles.keyboardAvoiding}
+        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+        keyboardVerticalOffset={0}
       >
+        <Animated.View
+          style={[
+            styles.pager,
+            {
+              width: layoutWidth ? layoutWidth * 2 : '200%',
+              transform: [{ translateX }],
+            },
+          ]}
+        >
         {/* Voice Mode */}
         <View style={[styles.page, { width: layoutWidth || '50%' }]}>
           <View style={styles.voiceCenter}>
@@ -558,10 +563,7 @@ export default function App() {
 
         {/* Text Mode */}
         <View style={[styles.page, { width: layoutWidth || '50%' }]}>
-          <KeyboardAvoidingView
-            style={styles.textWrap}
-            behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-          >
+          <View style={styles.textWrap}>
             <FlatList
               ref={listRef}
               data={messages}
@@ -598,15 +600,17 @@ export default function App() {
                 )}
               </TouchableOpacity>
             </View>
-          </KeyboardAvoidingView>
+          </View>
         </View>
       </Animated.View>
+      </KeyboardAvoidingView>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: '#000' },
+  keyboardAvoiding: { flex: 1 },
 
   topBar: {
     height: 56,
