@@ -312,7 +312,7 @@ export default function App() {
       const res = await fetch(`${API_BASE}/api/message`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: trimmed }),
+        body: JSON.stringify({ message: trimmed, device: 'ios' }),
       });
       const data = await res.json().catch(() => ({}));
       console.log('API /api/message response:', data);
@@ -385,6 +385,7 @@ export default function App() {
         type: 'audio/m4a',
         name: 'voice.m4a',
       });
+      form.append('device', 'ios');
       const res = await fetch(`${API_BASE}/api/voice`, {
         method: 'POST',
         body: form,
