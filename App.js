@@ -28,6 +28,7 @@ import {
   AudioModule,
 } from 'expo-audio';
 import * as FileSystemLegacy from 'expo-file-system/legacy';
+import { io } from 'socket.io-client';
 
 const API_BASE = 'https://web-production-0166f.up.railway.app';
 const PUSH_REGISTERED_KEY = 'angel_push_token_registered';
@@ -81,6 +82,18 @@ function makeId() {
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
+function parseAngelReply(data) {
+  if (data == null) return '';
+  if (typeof data === 'string') return data;
+  return (
+    data?.reply ??
+    data?.response ??
+    data?.text ??
+    data?.message ??
+    ''
+  );
+}
+
 export default function App() {
   const [mode, setMode] = useState('voice'); // 'voice' | 'text'
   const [layoutWidth, setLayoutWidth] = useState(0);
@@ -94,6 +107,11 @@ export default function App() {
   const [orbState, setOrbState] = useState('idle'); // 'idle' | 'listening' | 'speaking'
 
   const listRef = useRef(null);
+  const socketRef = useRef(null);
+  const expectingResponseRef = useRef(false);
+  const playTTSRef = useRef(null);
+
+  const [socketConnected, setSocketConnected] = useState(false);
 
   const ttsPlayer = useAudioPlayer(null);
   const ttsStatus = useAudioPlayerStatus(ttsPlayer);
@@ -374,6 +392,100 @@ export default function App() {
     }
   }, [ttsPlayer]);
 
+  useEffect(() => {
+    playTTSRef.current = playTTS;
+  }, [playTTS]);
+
+  // Socket.IO — real-time text/voice; HTTP used when disconnected
+  useEffect(() => {
+    const socket = io(API_BASE, {
+      auth: { device: 'ios' },
+      transports: ['websocket', 'polling'],
+      reconnection: true,
+      reconnectionAttempts: Infinity,
+      reconnectionDelay: 1000,
+    });
+    socketRef.current = socket;
+
+    const onConnect = () => {
+      setSocketConnected(true);
+      console.log('[socket] connected');
+    };
+    const onDisconnect = () => {
+      setSocketConnected(false);
+      if (expectingResponseRef.current) {
+        expectingResponseRef.current = false;
+        setLoading(false);
+        setOrbState('idle');
+      }
+      console.log('[socket] disconnected');
+    };
+    const onConnectError = (err) => {
+      setSocketConnected(false);
+      console.warn('[socket] connect_error:', err?.message ?? err);
+    };
+
+    const onAngelThinking = () => {
+      if (expectingResponseRef.current) {
+        setLoading(true);
+      }
+    };
+
+    const onAngelTranscript = (payload) => {
+      const text =
+        typeof payload === 'string'
+          ? payload
+          : payload?.transcript ?? payload?.text ?? '';
+      const trimmed = (text || '').trim();
+      if (trimmed) {
+        setMessages((prev) => [...prev, { id: makeId(), role: 'user', content: trimmed }]);
+      }
+    };
+
+    const onAngelResponse = (data) => {
+      expectingResponseRef.current = false;
+      setLoading(false);
+      const reply = parseAngelReply(data);
+      console.log('[socket] angel_response:', data);
+      if (reply) {
+        setMessages((prev) => [
+          ...prev,
+          { id: makeId(), role: 'assistant', content: reply },
+        ]);
+        playTTSRef.current?.(reply);
+      } else {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: makeId(),
+            role: 'assistant',
+            content: "Sorry, I couldn't process that.",
+          },
+        ]);
+        setOrbState('idle');
+      }
+    };
+
+    socket.on('connect', onConnect);
+    socket.on('disconnect', onDisconnect);
+    socket.on('connect_error', onConnectError);
+    socket.on('angel_thinking', onAngelThinking);
+    socket.on('angel_transcript', onAngelTranscript);
+    socket.on('angel_response', onAngelResponse);
+
+    return () => {
+      socket.off('connect', onConnect);
+      socket.off('disconnect', onDisconnect);
+      socket.off('connect_error', onConnectError);
+      socket.off('angel_thinking', onAngelThinking);
+      socket.off('angel_transcript', onAngelTranscript);
+      socket.off('angel_response', onAngelResponse);
+      socket.disconnect();
+      socketRef.current = null;
+      setSocketConnected(false);
+    };
+  }, []);
+
   const sendTextMessage = useCallback(async () => {
     const trimmed = (inputText || '').trim();
     if (!trimmed || loading) return;
@@ -381,8 +493,15 @@ export default function App() {
     setInputText('');
     const userMsg = { id: makeId(), role: 'user', content: trimmed };
     setMessages((prev) => [...prev, userMsg]);
-    setLoading(true);
+    const socket = socketRef.current;
+    if (socket?.connected) {
+      expectingResponseRef.current = true;
+      setLoading(true);
+      socket.emit('user_text', { message: trimmed });
+      return;
+    }
 
+    setLoading(true);
     try {
       const res = await fetch(`${API_BASE}/api/message`, {
         method: 'POST',
@@ -391,12 +510,7 @@ export default function App() {
       });
       const data = await res.json().catch(() => ({}));
       console.log('API /api/message response:', data);
-      const reply =
-        data?.reply ??
-        data?.response ??
-        data?.text ??
-        data?.message ??
-        (typeof data === 'string' ? data : '');
+      const reply = parseAngelReply(data) || (typeof data === 'string' ? data : '');
 
       const assistantMsg = {
         id: makeId(),
@@ -404,6 +518,9 @@ export default function App() {
         content: reply || 'Sorry, I couldn’t process that.',
       };
       setMessages((prev) => [...prev, assistantMsg]);
+      if (reply) {
+        await playTTS(reply);
+      }
     } catch (e) {
       setMessages((prev) => [
         ...prev,
@@ -412,7 +529,7 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, [inputText, loading]);
+  }, [inputText, loading, playTTS]);
 
   const startRecording = useCallback(async () => {
     try {
@@ -443,6 +560,7 @@ export default function App() {
       setOrbState('idle');
       return;
     }
+    let awaitingSocketVoice = false;
     try {
       await audioRecorder.stop();
       await setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true });
@@ -450,6 +568,28 @@ export default function App() {
 
       if (!uri) {
         setOrbState('idle');
+        return;
+      }
+
+      const socket = socketRef.current;
+      if (socket?.connected) {
+        let audioBase64;
+        try {
+          audioBase64 = await FileSystemLegacy.readAsStringAsync(uri, {
+            encoding: FileSystemLegacy.EncodingType.Base64,
+          });
+        } catch (readErr) {
+          console.warn('[voice] readAsStringAsync failed:', readErr);
+          setOrbState('idle');
+          return;
+        }
+        expectingResponseRef.current = true;
+        setLoading(true);
+        socket.emit('user_audio', {
+          audio_base64: audioBase64,
+          filename: 'voice.m4a',
+        });
+        awaitingSocketVoice = true;
         return;
       }
 
@@ -493,7 +633,9 @@ export default function App() {
         { id: makeId(), role: 'assistant', content: 'Voice message could not be sent.' },
       ]);
     } finally {
-      setLoading(false);
+      if (!awaitingSocketVoice) {
+        setLoading(false);
+      }
     }
   }, [recorderState?.isRecording, audioRecorder, playTTS]);
 
@@ -545,7 +687,15 @@ export default function App() {
       <StatusBar style="light" />
 
       <View style={styles.topBar}>
-        <Text style={styles.topTitle}>Angel</Text>
+        <View style={styles.topBarLeft}>
+          <View
+            style={[
+              styles.connDot,
+              { backgroundColor: socketConnected ? '#22C55E' : '#6B7280' },
+            ]}
+          />
+          <Text style={styles.topTitle}>Angel</Text>
+        </View>
         <TouchableOpacity onPress={toggleMode} style={styles.modeToggle}>
           <Text style={styles.modeToggleText}>{mode === 'voice' ? 'Text' : 'Voice'}</Text>
         </TouchableOpacity>
@@ -618,7 +768,9 @@ export default function App() {
 
             <Text style={styles.voiceHint}>
               {loading
-                ? 'Connecting…'
+                ? socketConnected
+                  ? 'Angel is thinking…'
+                  : 'Connecting…'
                 : orbState === 'speaking'
                   ? 'Angel is speaking…'
                   : isRecording
@@ -696,6 +848,14 @@ const styles = StyleSheet.create({
     borderBottomWidth: 1,
     borderBottomColor: '#111827',
     backgroundColor: '#000',
+  },
+  topBarLeft: { flexDirection: 'row', alignItems: 'center', gap: 10 },
+  connDot: {
+    width: 9,
+    height: 9,
+    borderRadius: 5,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.2)',
   },
   topTitle: { color: '#fff', fontSize: 18, fontWeight: '600', letterSpacing: 0.3 },
   modeToggle: {
