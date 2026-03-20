@@ -13,7 +13,10 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import Constants from 'expo-constants';
+import * as Device from 'expo-device';
+import * as Notifications from 'expo-notifications';
 import { StatusBar } from 'expo-status-bar';
 import {
   useAudioPlayer,
@@ -27,6 +30,17 @@ import {
 import * as FileSystemLegacy from 'expo-file-system/legacy';
 
 const API_BASE = 'https://web-production-0166f.up.railway.app';
+const PUSH_REGISTERED_KEY = 'angel_push_token_registered';
+
+Notifications.setNotificationHandler({
+  handleNotification: async () => ({
+    shouldPlaySound: true,
+    shouldSetBadge: true,
+    shouldShowBanner: true,
+    shouldShowList: true,
+    shouldAnimate: true,
+  }),
+});
 
 function arrayBufferToBase64(buffer) {
   const bytes = new Uint8Array(buffer);
@@ -207,6 +221,67 @@ export default function App() {
         }
       } catch (_) {
         // ignore
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Register Expo push token once per install (Railway backend)
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const already = await AsyncStorage.getItem(PUSH_REGISTERED_KEY);
+        if (already === '1') {
+          console.log('[push] already registered this install, skipping');
+          return;
+        }
+        if (!Device.isDevice) {
+          console.log('[push] not a physical device, skipping');
+          return;
+        }
+        if (Platform.OS === 'android') {
+          await Notifications.setNotificationChannelAsync('angel-default', {
+            name: 'Angel',
+            importance: Notifications.AndroidImportance.HIGH,
+            vibrationPattern: [0, 250, 250, 250],
+            lightColor: '#6D28FF',
+          });
+        }
+        const { status: existing } = await Notifications.getPermissionsAsync();
+        let finalStatus = existing;
+        if (existing !== 'granted') {
+          const { status } = await Notifications.requestPermissionsAsync();
+          finalStatus = status;
+        }
+        if (finalStatus !== 'granted') {
+          console.log('[push] notification permission not granted');
+          return;
+        }
+        const projectId =
+          Constants?.expoConfig?.extra?.eas?.projectId ?? Constants?.easConfig?.projectId;
+        if (!projectId) {
+          console.warn('[push] missing EAS projectId in app config');
+          return;
+        }
+        const tokenData = await Notifications.getExpoPushTokenAsync({ projectId });
+        const token = tokenData?.data;
+        if (!token || cancelled) return;
+        const res = await fetch(`${API_BASE}/api/register_push_token`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token, user_id: 'tyler' }),
+        });
+        if (res.ok) {
+          await AsyncStorage.setItem(PUSH_REGISTERED_KEY, '1');
+          console.log('[push] token registered with backend');
+        } else {
+          console.warn('[push] register_push_token failed:', res.status);
+        }
+      } catch (e) {
+        console.warn('[push] registration error:', e?.message ?? e);
       }
     })();
     return () => {
