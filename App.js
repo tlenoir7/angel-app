@@ -779,6 +779,20 @@ export default function App() {
     const trimmed = (inputText || '').trim();
     if (!trimmed || loading) return;
 
+    // Race fix: first GPS fix may still be in flight from mount; ref stays null until then.
+    let locField = locationFieldFromRef(locationRef);
+    if (!locField) {
+      console.log(
+        '[location] locationRef.current empty before send; awaiting refreshLocation() fallback'
+      );
+      await refreshLocation();
+      locField = locationFieldFromRef(locationRef);
+    }
+    console.log('[location] at send time (text message)', {
+      locationRefCurrent: locationRef.current,
+      locFieldForPayload: locField,
+    });
+
     setInputText('');
     const userMsg = { id: makeId(), role: 'user', content: trimmed };
     setMessages((prev) => [...prev, userMsg]);
@@ -788,8 +802,11 @@ export default function App() {
       expectingResponseRef.current = true;
       setLoading(true);
       const textPayload = { message: trimmed };
-      const textLoc = locationFieldFromRef(locationRef);
-      if (textLoc) textPayload.location = textLoc;
+      if (locField) textPayload.location = locField;
+      console.log('[location] before socket user_text emit', {
+        locationRefCurrent: locationRef.current,
+        payloadHasLocation: !!textPayload.location,
+      });
       socket.emit('user_text', textPayload);
       return;
     }
@@ -797,8 +814,16 @@ export default function App() {
     setLoading(true);
     try {
       const messageBody = { message: trimmed, device: 'ios' };
-      const messageLoc = locationFieldFromRef(locationRef);
-      if (messageLoc) messageBody.location = messageLoc;
+      if (locField) messageBody.location = locField;
+      console.log(
+        '[location] locationRef.current immediately before /api/chat fetch:',
+        locationRef.current
+      );
+      console.log('[chat] /api/chat request body', {
+        ...messageBody,
+        message:
+          trimmed.length > 100 ? `${trimmed.slice(0, 100)}… (${trimmed.length} chars)` : trimmed,
+      });
       const res = await fetch(`${API_BASE}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -823,7 +848,7 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, [inputText, loading]);
+  }, [inputText, loading, refreshLocation]);
 
   const startRecording = useCallback(async () => {
     try {
