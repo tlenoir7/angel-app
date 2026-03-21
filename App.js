@@ -113,7 +113,8 @@ export default function App() {
 
   const [socketConnected, setSocketConnected] = useState(false);
 
-  const ttsPlayer = useAudioPlayer(null);
+  // SDK 55: call with no args when source is set later via replace() (avoids native ctor mismatch)
+  const ttsPlayer = useAudioPlayer();
   const ttsStatus = useAudioPlayerStatus(ttsPlayer);
   const audioRecorder = useAudioRecorder(RecordingPresets.HIGH_QUALITY);
   const recorderState = useAudioRecorderState(audioRecorder);

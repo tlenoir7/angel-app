@@ -20,7 +20,13 @@
     "expo-status-bar": "~55.0.4",
     "react": "19.2.0",
     "react-native": "0.83.2",
-    "socket.io-client": "^4.8.3"
+    "socket.io-client": "4.6.2"
+  },
+  "react-native": {
+    "resolver": {
+      "bufferutil": "bufferutil",
+      "utf-8-validate": "utf-8-validate"
+    }
   },
   "private": true
 }
