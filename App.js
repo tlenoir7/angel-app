@@ -31,6 +31,8 @@ import * as FileSystemLegacy from 'expo-file-system/legacy';
 import { io } from 'socket.io-client';
 
 const API_BASE = 'https://web-production-0166f.up.railway.app';
+/** Default Engine.IO path; handshake uses e.g. wss://host/socket.io/?EIO=4&transport=websocket */
+const SOCKET_IO_PATH = '/socket.io';
 const PUSH_REGISTERED_KEY = 'angel_push_token_registered';
 
 Notifications.setNotificationHandler({
@@ -110,8 +112,16 @@ export default function App() {
   const socketRef = useRef(null);
   const expectingResponseRef = useRef(false);
   const playTTSRef = useRef(null);
+  /** Latest UI mode for socket handlers (voice | text) */
+  const modeRef = useRef(mode);
+  /** True if the in-flight socket reply is for a `user_audio` emit (not `user_text`) */
+  const lastSocketRequestWasVoiceRef = useRef(false);
 
   const [socketConnected, setSocketConnected] = useState(false);
+
+  useEffect(() => {
+    modeRef.current = mode;
+  }, [mode]);
 
   // SDK 55: call with no args when source is set later via replace() (avoids native ctor mismatch)
   const ttsPlayer = useAudioPlayer();
@@ -399,7 +409,15 @@ export default function App() {
 
   // Socket.IO — real-time text/voice; HTTP used when disconnected
   useEffect(() => {
+    console.log('[socket] initializing client', {
+      url: API_BASE,
+      path: SOCKET_IO_PATH,
+      auth: { device: 'ios' },
+      transports: ['websocket', 'polling'],
+    });
+
     const socket = io(API_BASE, {
+      path: SOCKET_IO_PATH,
       auth: { device: 'ios' },
       transports: ['websocket', 'polling'],
       reconnection: true,
@@ -410,20 +428,35 @@ export default function App() {
 
     const onConnect = () => {
       setSocketConnected(true);
-      console.log('[socket] connected');
+      const transport = socket.io?.engine?.transport?.name ?? 'unknown';
+      console.log('[socket] connected', {
+        id: socket.id,
+        connected: socket.connected,
+        transport,
+        url: API_BASE,
+        path: SOCKET_IO_PATH,
+      });
     };
-    const onDisconnect = () => {
+    const onDisconnect = (reason) => {
       setSocketConnected(false);
       if (expectingResponseRef.current) {
         expectingResponseRef.current = false;
         setLoading(false);
         setOrbState('idle');
       }
-      console.log('[socket] disconnected');
+      console.log('[socket] disconnected', { reason, url: API_BASE, path: SOCKET_IO_PATH });
     };
     const onConnectError = (err) => {
       setSocketConnected(false);
-      console.warn('[socket] connect_error:', err?.message ?? err);
+      console.warn('[socket] connect_error', {
+        message: err?.message ?? String(err),
+        description: err?.description,
+        context: err?.context,
+        type: err?.type,
+        data: err?.data,
+        url: API_BASE,
+        path: SOCKET_IO_PATH,
+      });
     };
 
     const onAngelThinking = () => {
@@ -447,13 +480,25 @@ export default function App() {
       expectingResponseRef.current = false;
       setLoading(false);
       const reply = parseAngelReply(data);
-      console.log('[socket] angel_response:', data);
+      const fromVoice = lastSocketRequestWasVoiceRef.current;
+      const inVoiceMode = modeRef.current === 'voice';
+      const shouldPlayTTS = inVoiceMode || fromVoice;
+      console.log('[socket] angel_response:', {
+        data,
+        inVoiceMode,
+        fromVoiceRequest: fromVoice,
+        shouldPlayTTS,
+      });
       if (reply) {
         setMessages((prev) => [
           ...prev,
           { id: makeId(), role: 'assistant', content: reply },
         ]);
-        playTTSRef.current?.(reply);
+        if (shouldPlayTTS) {
+          playTTSRef.current?.(reply);
+        } else {
+          setOrbState('idle');
+        }
       } else {
         setMessages((prev) => [
           ...prev,
@@ -474,6 +519,28 @@ export default function App() {
     socket.on('angel_transcript', onAngelTranscript);
     socket.on('angel_response', onAngelResponse);
 
+    const mgr = socket.io;
+    const onReconnectAttempt = (n) => {
+      console.log('[socket] reconnect_attempt', { attempt: n, url: API_BASE, path: SOCKET_IO_PATH });
+    };
+    const onReconnect = (n) => {
+      console.log('[socket] reconnect OK', { attempts: n, url: API_BASE, path: SOCKET_IO_PATH });
+    };
+    const onReconnectError = (e) => {
+      console.warn('[socket] reconnect_error', {
+        message: e?.message ?? String(e),
+        url: API_BASE,
+        path: SOCKET_IO_PATH,
+      });
+    };
+    const onReconnectFailed = () => {
+      console.warn('[socket] reconnect_failed (giving up)', { url: API_BASE, path: SOCKET_IO_PATH });
+    };
+    mgr.on('reconnect_attempt', onReconnectAttempt);
+    mgr.on('reconnect', onReconnect);
+    mgr.on('reconnect_error', onReconnectError);
+    mgr.on('reconnect_failed', onReconnectFailed);
+
     return () => {
       socket.off('connect', onConnect);
       socket.off('disconnect', onDisconnect);
@@ -481,9 +548,14 @@ export default function App() {
       socket.off('angel_thinking', onAngelThinking);
       socket.off('angel_transcript', onAngelTranscript);
       socket.off('angel_response', onAngelResponse);
+      mgr.off('reconnect_attempt', onReconnectAttempt);
+      mgr.off('reconnect', onReconnect);
+      mgr.off('reconnect_error', onReconnectError);
+      mgr.off('reconnect_failed', onReconnectFailed);
       socket.disconnect();
       socketRef.current = null;
       setSocketConnected(false);
+      console.log('[socket] client torn down', { url: API_BASE, path: SOCKET_IO_PATH });
     };
   }, []);
 
@@ -496,6 +568,7 @@ export default function App() {
     setMessages((prev) => [...prev, userMsg]);
     const socket = socketRef.current;
     if (socket?.connected) {
+      lastSocketRequestWasVoiceRef.current = false;
       expectingResponseRef.current = true;
       setLoading(true);
       socket.emit('user_text', { message: trimmed });
@@ -519,9 +592,7 @@ export default function App() {
         content: reply || 'Sorry, I couldn’t process that.',
       };
       setMessages((prev) => [...prev, assistantMsg]);
-      if (reply) {
-        await playTTS(reply);
-      }
+      /* Text mode: show reply only, no TTS */
     } catch (e) {
       setMessages((prev) => [
         ...prev,
@@ -530,7 +601,7 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, [inputText, loading, playTTS]);
+  }, [inputText, loading]);
 
   const startRecording = useCallback(async () => {
     try {
@@ -584,6 +655,7 @@ export default function App() {
           setOrbState('idle');
           return;
         }
+        lastSocketRequestWasVoiceRef.current = true;
         expectingResponseRef.current = true;
         setLoading(true);
         socket.emit('user_audio', {
