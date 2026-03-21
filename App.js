@@ -4,7 +4,9 @@ import {
   Animated,
   Easing,
   FlatList,
+  Image,
   KeyboardAvoidingView,
+  Modal,
   Platform,
   Pressable,
   StyleSheet,
@@ -13,6 +15,8 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
+import { Ionicons } from '@expo/vector-icons';
+import * as ImagePicker from 'expo-image-picker';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Constants from 'expo-constants';
 import * as Device from 'expo-device';
@@ -34,6 +38,8 @@ const API_BASE = 'https://web-production-0166f.up.railway.app';
 /** Default Engine.IO path; handshake uses e.g. wss://host/socket.io/?EIO=4&transport=websocket */
 const SOCKET_IO_PATH = '/socket.io';
 const PUSH_REGISTERED_KEY = 'angel_push_token_registered';
+const VISION_ANALYZE_QUESTION =
+  'What do you see? Describe everything relevant to my mission.';
 
 Notifications.setNotificationHandler({
   handleNotification: async () => ({
@@ -118,6 +124,12 @@ export default function App() {
   const lastSocketRequestWasVoiceRef = useRef(false);
 
   const [socketConnected, setSocketConnected] = useState(false);
+
+  const [visionModalVisible, setVisionModalVisible] = useState(false);
+  const [visionImageBase64, setVisionImageBase64] = useState('');
+  const [visionPreviewUri, setVisionPreviewUri] = useState('');
+  const [visionQuestionText, setVisionQuestionText] = useState('');
+  const [visionSending, setVisionSending] = useState(false);
 
   useEffect(() => {
     modeRef.current = mode;
@@ -327,6 +339,53 @@ export default function App() {
     setMode((m) => (m === 'voice' ? 'text' : 'voice'));
   }, []);
 
+  const closeVisionModal = useCallback(() => {
+    setVisionModalVisible(false);
+    setVisionImageBase64('');
+    setVisionPreviewUri('');
+    setVisionQuestionText('');
+  }, []);
+
+  const openCameraForVision = useCallback(async () => {
+    if (loading || visionSending || visionModalVisible) return;
+    try {
+      const { status } = await ImagePicker.requestCameraPermissionsAsync();
+      if (status !== 'granted') {
+        console.warn('[vision] camera permission denied:', status);
+        return;
+      }
+      const result = await ImagePicker.launchCameraAsync({
+        mediaTypes: ['images'],
+        allowsEditing: false,
+        quality: 0.85,
+        base64: true,
+      });
+      if (result.canceled || !result.assets?.[0]) return;
+      const asset = result.assets[0];
+      let b64 = asset.base64;
+      if (!b64 && asset.uri) {
+        try {
+          b64 = await FileSystemLegacy.readAsStringAsync(asset.uri, {
+            encoding: FileSystemLegacy.EncodingType.Base64,
+          });
+        } catch (readErr) {
+          console.warn('[vision] read image base64 failed:', readErr);
+          return;
+        }
+      }
+      if (!b64) {
+        console.warn('[vision] no base64 available for captured image');
+        return;
+      }
+      setVisionImageBase64(b64);
+      setVisionPreviewUri(asset.uri ?? '');
+      setVisionQuestionText('');
+      setVisionModalVisible(true);
+    } catch (e) {
+      console.warn('[vision] camera error:', e?.message ?? e);
+    }
+  }, [loading, visionSending, visionModalVisible]);
+
   const playTTS = useCallback(async (text) => {
     if (!text?.trim()) return;
     let step = 'init';
@@ -406,6 +465,60 @@ export default function App() {
   useEffect(() => {
     playTTSRef.current = playTTS;
   }, [playTTS]);
+
+  const submitVision = useCallback(
+    async (question) => {
+      const q = (question || '').trim();
+      if (!q || !visionImageBase64 || visionSending) return;
+      setVisionSending(true);
+      try {
+        const res = await fetch(`${API_BASE}/api/vision`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            image: visionImageBase64,
+            question: q,
+            device: 'ios',
+          }),
+        });
+        const data = await res.json().catch(() => ({}));
+        console.log('[vision] /api/vision response:', { status: res.status, data });
+        const reply =
+          parseAngelReply(data) || (typeof data === 'string' ? data : '');
+        const userLine = `📷 ${q}`;
+        setMessages((prev) => [
+          ...prev,
+          { id: makeId(), role: 'user', content: userLine },
+          {
+            id: makeId(),
+            role: 'assistant',
+            content: reply || "I couldn't interpret that image. Try again.",
+          },
+        ]);
+        closeVisionModal();
+        const finalReply = reply || '';
+        if (finalReply && modeRef.current === 'voice') {
+          await playTTS(finalReply);
+        } else if (!finalReply) {
+          setOrbState('idle');
+        }
+      } catch (e) {
+        console.warn('[vision] request failed:', e?.message ?? e);
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: makeId(),
+            role: 'assistant',
+            content: 'Vision request failed. Check your connection and try again.',
+          },
+        ]);
+        closeVisionModal();
+      } finally {
+        setVisionSending(false);
+      }
+    },
+    [visionImageBase64, visionSending, playTTS, closeVisionModal]
+  );
 
   // Socket.IO — real-time text/voice; HTTP used when disconnected
   useEffect(() => {
@@ -790,7 +903,8 @@ export default function App() {
         >
         {/* Voice Mode */}
         <View style={[styles.page, { width: layoutWidth || '50%' }]}>
-          <View style={styles.voiceCenter}>
+          <View style={styles.voicePage}>
+            <View style={styles.voiceCenter}>
             <Text style={styles.voiceName}>Angel</Text>
 
             <View style={styles.orbWrap}>
@@ -858,6 +972,17 @@ export default function App() {
             >
               <Text style={styles.holdToSpeakText}>{isRecording ? 'Release' : 'Hold'}</Text>
             </Pressable>
+            </View>
+            <View style={styles.voiceBottomBar}>
+              <TouchableOpacity
+                style={styles.cameraIconBtn}
+                onPress={openCameraForVision}
+                disabled={loading || visionSending || visionModalVisible}
+                accessibilityLabel="Open camera for vision"
+              >
+                <Ionicons name="camera" size={22} color="#E5E7EB" />
+              </TouchableOpacity>
+            </View>
           </View>
         </View>
 
@@ -878,6 +1003,14 @@ export default function App() {
             />
 
             <View style={styles.inputRow}>
+              <TouchableOpacity
+                style={styles.inputRowCamera}
+                onPress={openCameraForVision}
+                disabled={loading || visionSending || visionModalVisible}
+                accessibilityLabel="Open camera for vision"
+              >
+                <Ionicons name="camera" size={22} color="#E5E7EB" />
+              </TouchableOpacity>
               <TextInput
                 style={styles.input}
                 placeholder="Message Angel…"
@@ -904,6 +1037,82 @@ export default function App() {
         </View>
       </Animated.View>
       </KeyboardAvoidingView>
+
+      <Modal
+        visible={visionModalVisible}
+        animationType="slide"
+        transparent
+        onRequestClose={() => {
+          if (!visionSending) closeVisionModal();
+        }}
+      >
+        <KeyboardAvoidingView
+          style={styles.visionModalRoot}
+          behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+        >
+          <Pressable
+            style={StyleSheet.absoluteFill}
+            onPress={() => {
+              if (!visionSending) closeVisionModal();
+            }}
+          />
+          <View style={styles.visionModalCard}>
+            <Text style={styles.visionModalTitle}>What do you want to know?</Text>
+            {visionPreviewUri ? (
+              <Image
+                source={{ uri: visionPreviewUri }}
+                style={styles.visionPreview}
+                resizeMode="cover"
+              />
+            ) : null}
+            <TextInput
+              style={styles.visionQuestionInput}
+              placeholder="What do you want to know?"
+              placeholderTextColor="#6B7280"
+              value={visionQuestionText}
+              onChangeText={setVisionQuestionText}
+              editable={!visionSending}
+              multiline
+              maxLength={2000}
+            />
+            <TouchableOpacity
+              style={styles.visionAnalyzeBtn}
+              onPress={() => submitVision(VISION_ANALYZE_QUESTION)}
+              disabled={visionSending || !visionImageBase64}
+            >
+              <Text style={styles.visionAnalyzeBtnText}>Analyze</Text>
+              <Text style={styles.visionAnalyzeHint} numberOfLines={2}>
+                {VISION_ANALYZE_QUESTION}
+              </Text>
+            </TouchableOpacity>
+            <View style={styles.visionModalActions}>
+              <TouchableOpacity
+                style={styles.visionCancelBtn}
+                onPress={() => {
+                  if (!visionSending) closeVisionModal();
+                }}
+                disabled={visionSending}
+              >
+                <Text style={styles.visionCancelBtnText}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[
+                  styles.visionSendBtn,
+                  (!visionQuestionText.trim() || visionSending) && styles.visionSendBtnDisabled,
+                ]}
+                onPress={() => submitVision(visionQuestionText)}
+                disabled={!visionQuestionText.trim() || visionSending || !visionImageBase64}
+              >
+                {visionSending ? (
+                  <ActivityIndicator size="small" color="#000" />
+                ) : (
+                  <Text style={styles.visionSendBtnText}>Send</Text>
+                )}
+              </TouchableOpacity>
+            </View>
+          </View>
+        </KeyboardAvoidingView>
+      </Modal>
     </View>
   );
 }
@@ -945,7 +1154,26 @@ const styles = StyleSheet.create({
   page: { flex: 1, backgroundColor: '#000' },
 
   // Voice mode
+  voicePage: { flex: 1 },
   voiceCenter: { flex: 1, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 24 },
+  voiceBottomBar: {
+    paddingVertical: 14,
+    paddingHorizontal: 24,
+    alignItems: 'center',
+    borderTopWidth: 1,
+    borderTopColor: '#111827',
+    backgroundColor: '#000',
+  },
+  cameraIconBtn: {
+    width: 48,
+    height: 48,
+    borderRadius: 24,
+    backgroundColor: '#111827',
+    borderWidth: 1,
+    borderColor: '#1F2937',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   voiceName: { color: '#fff', fontSize: 22, fontWeight: '600', marginBottom: 22 },
   orbWrap: { alignItems: 'center', justifyContent: 'center', marginBottom: 22 },
   rippleRing: {
@@ -1032,14 +1260,25 @@ const styles = StyleSheet.create({
   briefingLabel: { color: '#A78BFA', fontSize: 12, fontWeight: '700', marginBottom: 6, letterSpacing: 0.4 },
   bubbleText: { color: '#fff', fontSize: 16, lineHeight: 22 },
   inputRow: {
-    paddingHorizontal: 14,
+    paddingHorizontal: 10,
     paddingVertical: 12,
     borderTopWidth: 1,
     borderTopColor: '#111827',
     flexDirection: 'row',
-    gap: 10,
+    gap: 8,
     alignItems: 'flex-end',
     backgroundColor: '#000',
+  },
+  inputRowCamera: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: '#111827',
+    borderWidth: 1,
+    borderColor: '#1F2937',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 0,
   },
   input: {
     flex: 1,
@@ -1064,4 +1303,95 @@ const styles = StyleSheet.create({
   },
   sendBtnDisabled: { opacity: 0.7 },
   sendBtnText: { color: '#000', fontSize: 15, fontWeight: '700' },
+
+  visionModalRoot: {
+    flex: 1,
+    justifyContent: 'flex-end',
+    backgroundColor: 'rgba(0,0,0,0.88)',
+  },
+  visionModalCard: {
+    backgroundColor: '#0B0F1A',
+    borderTopLeftRadius: 20,
+    borderTopRightRadius: 20,
+    borderWidth: 1,
+    borderColor: '#1F2937',
+    paddingHorizontal: 20,
+    paddingTop: 20,
+    paddingBottom: 28,
+  },
+  visionModalTitle: {
+    color: '#fff',
+    fontSize: 18,
+    fontWeight: '700',
+    marginBottom: 14,
+    textAlign: 'center',
+  },
+  visionPreview: {
+    width: 140,
+    height: 140,
+    borderRadius: 12,
+    alignSelf: 'center',
+    marginBottom: 16,
+    backgroundColor: '#111827',
+  },
+  visionQuestionInput: {
+    minHeight: 88,
+    maxHeight: 160,
+    borderRadius: 14,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    backgroundColor: '#050509',
+    color: '#fff',
+    borderWidth: 1,
+    borderColor: '#111827',
+    fontSize: 16,
+    marginBottom: 14,
+    textAlignVertical: 'top',
+  },
+  visionAnalyzeBtn: {
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+    borderRadius: 14,
+    backgroundColor: '#111827',
+    borderWidth: 1,
+    borderColor: '#374151',
+    marginBottom: 16,
+  },
+  visionAnalyzeBtnText: {
+    color: '#A78BFA',
+    fontSize: 15,
+    fontWeight: '700',
+    marginBottom: 6,
+  },
+  visionAnalyzeHint: {
+    color: '#9CA3AF',
+    fontSize: 12,
+    lineHeight: 17,
+  },
+  visionModalActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 12,
+  },
+  visionCancelBtn: {
+    paddingVertical: 14,
+    paddingHorizontal: 18,
+  },
+  visionCancelBtnText: {
+    color: '#9CA3AF',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  visionSendBtn: {
+    flex: 1,
+    maxWidth: 200,
+    height: 48,
+    borderRadius: 24,
+    backgroundColor: '#fff',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  visionSendBtnDisabled: { opacity: 0.5 },
+  visionSendBtnText: { color: '#000', fontSize: 16, fontWeight: '700' },
 });

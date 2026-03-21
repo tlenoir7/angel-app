@@ -16,6 +16,7 @@
       "bundleIdentifier": "com.tlenoir.angelassistant",
       "infoPlist": {
         "NSMicrophoneUsageDescription": "Angel needs microphone access for voice messages.",
+        "NSCameraUsageDescription": "Angel uses the camera so you can ask questions about what you see.",
         "UIBackgroundModes": [
           "audio",
           "remote-notification",
@@ -34,9 +35,11 @@
       },
       "permissions": [
         "RECORD_AUDIO",
+        "CAMERA",
         "android.permission.RECEIVE_BOOT_COMPLETED",
         "android.permission.RECORD_AUDIO",
-        "android.permission.MODIFY_AUDIO_SETTINGS"
+        "android.permission.MODIFY_AUDIO_SETTINGS",
+        "android.permission.CAMERA"
       ]
     },
     "plugins": [
@@ -50,6 +53,13 @@
         "expo-notifications",
         {
           "sounds": []
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Angel can attach photos when you choose from the library.",
+          "cameraPermission": "Angel uses the camera so you can ask questions about what you see."
         }
       ],
       "expo-dev-client"
