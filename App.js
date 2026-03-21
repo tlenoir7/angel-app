@@ -17,6 +17,7 @@ import {
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import * as ImagePicker from 'expo-image-picker';
+import * as Location from 'expo-location';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Constants from 'expo-constants';
 import * as Device from 'expo-device';
@@ -115,6 +116,7 @@ export default function App() {
   const [orbState, setOrbState] = useState('idle'); // 'idle' | 'listening' | 'speaking'
 
   const listRef = useRef(null);
+  const locationRef = useRef(null);
   const socketRef = useRef(null);
   const expectingResponseRef = useRef(false);
   const playTTSRef = useRef(null);
@@ -134,6 +136,67 @@ export default function App() {
   useEffect(() => {
     modeRef.current = mode;
   }, [mode]);
+
+  const refreshLocation = useCallback(async () => {
+    try {
+      const { status } = await Location.getForegroundPermissionsAsync();
+      if (status !== 'granted') {
+        locationRef.current = null;
+        return;
+      }
+      const pos = await Location.getCurrentPositionAsync({
+        accuracy: Location.Accuracy.Balanced,
+      });
+      const { latitude, longitude } = pos.coords;
+      let place_name = '';
+      try {
+        const places = await Location.reverseGeocodeAsync({ latitude, longitude });
+        const first = places?.[0];
+        place_name = placeNameFromGeocode(first);
+      } catch (geoErr) {
+        console.warn('[location] reverseGeocodeAsync failed:', geoErr?.message ?? geoErr);
+      }
+      locationRef.current = {
+        latitude,
+        longitude,
+        place_name: place_name || '',
+      };
+      console.log('[location] updated', {
+        latitude,
+        longitude,
+        place_name: place_name || '(none)',
+      });
+    } catch (e) {
+      console.warn('[location] getCurrentPositionAsync failed:', e?.message ?? e);
+    }
+  }, []);
+
+  useEffect(() => {
+    let intervalId;
+    let cancelled = false;
+    (async () => {
+      try {
+        const { status } = await Location.requestForegroundPermissionsAsync();
+        if (cancelled) return;
+        if (status !== 'granted') {
+          locationRef.current = null;
+          console.log('[location] foreground permission not granted:', status);
+          return;
+        }
+        await refreshLocation();
+        if (cancelled) return;
+        intervalId = setInterval(() => {
+          refreshLocation();
+        }, 5 * 60 * 1000);
+      } catch (e) {
+        console.warn('[location] requestForegroundPermissionsAsync failed:', e?.message ?? e);
+      }
+    })();
+    return () => {
+      cancelled = true;
+      if (intervalId) clearInterval(intervalId);
+    };
+  }, [refreshLocation]);
 
   // SDK 55: call with no args when source is set later via replace() (avoids native ctor mismatch)
   const ttsPlayer = useAudioPlayer();
@@ -472,14 +535,17 @@ export default function App() {
       if (!q || !visionImageBase64 || visionSending) return;
       setVisionSending(true);
       try {
+        const visionBody = {
+          image: visionImageBase64,
+          question: q,
+          device: 'ios',
+        };
+        const visionLoc = locationFieldFromRef(locationRef);
+        if (visionLoc) visionBody.location = visionLoc;
         const res = await fetch(`${API_BASE}/api/vision`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            image: visionImageBase64,
-            question: q,
-            device: 'ios',
-          }),
+          body: JSON.stringify(visionBody),
         });
         const data = await res.json().catch(() => ({}));
         console.log('[vision] /api/vision response:', { status: res.status, data });
@@ -690,10 +756,13 @@ export default function App() {
 
     setLoading(true);
     try {
+      const messageBody = { message: trimmed, device: 'ios' };
+      const messageLoc = locationFieldFromRef(locationRef);
+      if (messageLoc) messageBody.location = messageLoc;
       const res = await fetch(`${API_BASE}/api/message`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: trimmed, device: 'ios' }),
+        body: JSON.stringify(messageBody),
       });
       const data = await res.json().catch(() => ({}));
       console.log('API /api/message response:', data);
@@ -787,6 +856,10 @@ export default function App() {
         name: 'voice.m4a',
       });
       form.append('device', 'ios');
+      const voiceLoc = locationFieldFromRef(locationRef);
+      if (voiceLoc) {
+        form.append('location', JSON.stringify(voiceLoc));
+      }
       const res = await fetch(`${API_BASE}/api/voice`, {
         method: 'POST',
         body: form,
