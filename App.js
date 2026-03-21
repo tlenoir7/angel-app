@@ -103,6 +103,43 @@ function parseAngelReply(data) {
   );
 }
 
+/** Readable label from expo-location reverseGeocode first result */
+function placeNameFromGeocode(a) {
+  if (!a) return '';
+  if (a.formattedAddress) return String(a.formattedAddress).trim();
+  const street =
+    a.streetNumber && a.street
+      ? `${a.streetNumber} ${a.street}`
+      : a.street || a.name || '';
+  const parts = [street, a.district, a.city, a.subregion, a.region, a.postalCode, a.country].filter(
+    (p) => p != null && String(p).trim() !== ''
+  );
+  return parts.join(', ').trim();
+}
+
+/**
+ * Payload for API/socket: { latitude, longitude, place }.
+ * Returns null if coords unavailable (permission denied, error, etc.).
+ */
+function locationFieldFromRef(locRef) {
+  const loc = locRef?.current;
+  if (
+    !loc ||
+    typeof loc.latitude !== 'number' ||
+    Number.isNaN(loc.latitude) ||
+    typeof loc.longitude !== 'number' ||
+    Number.isNaN(loc.longitude)
+  ) {
+    return null;
+  }
+  const place = typeof loc.place === 'string' ? loc.place : '';
+  return {
+    latitude: loc.latitude,
+    longitude: loc.longitude,
+    place: place || '',
+  };
+}
+
 export default function App() {
   const [mode, setMode] = useState('voice'); // 'voice' | 'text'
   const [layoutWidth, setLayoutWidth] = useState(0);
@@ -159,12 +196,12 @@ export default function App() {
       locationRef.current = {
         latitude,
         longitude,
-        place_name: place_name || '',
+        place: place_name || '',
       };
       console.log('[location] updated', {
         latitude,
         longitude,
-        place_name: place_name || '(none)',
+        place: place_name || '(none)',
       });
     } catch (e) {
       console.warn('[location] getCurrentPositionAsync failed:', e?.message ?? e);
@@ -750,7 +787,10 @@ export default function App() {
       lastSocketRequestWasVoiceRef.current = false;
       expectingResponseRef.current = true;
       setLoading(true);
-      socket.emit('user_text', { message: trimmed });
+      const textPayload = { message: trimmed };
+      const textLoc = locationFieldFromRef(locationRef);
+      if (textLoc) textPayload.location = textLoc;
+      socket.emit('user_text', textPayload);
       return;
     }
 
@@ -759,13 +799,13 @@ export default function App() {
       const messageBody = { message: trimmed, device: 'ios' };
       const messageLoc = locationFieldFromRef(locationRef);
       if (messageLoc) messageBody.location = messageLoc;
-      const res = await fetch(`${API_BASE}/api/message`, {
+      const res = await fetch(`${API_BASE}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(messageBody),
       });
       const data = await res.json().catch(() => ({}));
-      console.log('API /api/message response:', data);
+      console.log('API /api/chat response:', data);
       const reply = parseAngelReply(data) || (typeof data === 'string' ? data : '');
 
       const assistantMsg = {
@@ -840,10 +880,13 @@ export default function App() {
         lastSocketRequestWasVoiceRef.current = true;
         expectingResponseRef.current = true;
         setLoading(true);
-        socket.emit('user_audio', {
+        const audioPayload = {
           audio_base64: audioBase64,
           filename: 'voice.m4a',
-        });
+        };
+        const audioLoc = locationFieldFromRef(locationRef);
+        if (audioLoc) audioPayload.location = audioLoc;
+        socket.emit('user_audio', audioPayload);
         awaitingSocketVoice = true;
         return;
       }
