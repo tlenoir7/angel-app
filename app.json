@@ -18,6 +18,7 @@
         "NSMicrophoneUsageDescription": "Angel needs microphone access for voice messages.",
         "NSCameraUsageDescription": "Angel uses the camera so you can ask questions about what you see.",
         "NSLocationWhenInUseUsageDescription": "Angel uses your location to give context-aware help when you message, speak, or use the camera.",
+        "NSPhotoLibraryUsageDescription": "Angel can attach photos from your library to your messages.",
         "UIBackgroundModes": [
           "audio",
           "remote-notification",

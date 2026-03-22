@@ -16,6 +16,7 @@ import {
   View,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import * as DocumentPicker from 'expo-document-picker';
 import * as ImagePicker from 'expo-image-picker';
 import * as Location from 'expo-location';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -41,6 +42,25 @@ const SOCKET_IO_PATH = '/socket.io';
 const PUSH_REGISTERED_KEY = 'angel_push_token_registered';
 const VISION_ANALYZE_QUESTION =
   'What do you see? Describe everything relevant to my mission.';
+/** Default context when sending an attachment with no typed message */
+const DEFAULT_ATTACHMENT_MESSAGE = 'Analyze this';
+
+/** MIME types for document picker (PDF, Office, text, common code) */
+const DOCUMENT_PICKER_TYPES = [
+  'application/pdf',
+  'application/msword',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'text/csv',
+  'text/plain',
+  'text/html',
+  'text/javascript',
+  'application/json',
+  'text/x-python',
+  'text/x-java-source',
+  'text/x-c',
+  'application/xml',
+  'text/xml',
+];
 
 Notifications.setNotificationHandler({
   handleNotification: async () => ({
@@ -169,6 +189,13 @@ export default function App() {
   const [visionPreviewUri, setVisionPreviewUri] = useState('');
   const [visionQuestionText, setVisionQuestionText] = useState('');
   const [visionSending, setVisionSending] = useState(false);
+
+  /** Text-mode file/photo attachment before send (separate from camera vision flow) */
+  const [textAttachment, setTextAttachment] = useState(null);
+  /** Modal: Choose File vs Choose Photo */
+  const [attachMenuVisible, setAttachMenuVisible] = useState(false);
+  /** Brief status above input while uploading/analyzing attachment */
+  const [attachmentStatus, setAttachmentStatus] = useState(null);
 
   useEffect(() => {
     modeRef.current = mode;
@@ -486,6 +513,72 @@ export default function App() {
     }
   }, [loading, visionSending, visionModalVisible]);
 
+  const clearTextAttachment = useCallback(() => {
+    setTextAttachment(null);
+  }, []);
+
+  const pickDocumentForText = useCallback(async () => {
+    setAttachMenuVisible(false);
+    try {
+      const result = await DocumentPicker.getDocumentAsync({
+        copyToCacheDirectory: true,
+        type: DOCUMENT_PICKER_TYPES,
+        multiple: false,
+      });
+      if (result.canceled || !result.assets?.[0]) return;
+      const asset = result.assets[0];
+      const b64 = await FileSystemLegacy.readAsStringAsync(asset.uri, {
+        encoding: FileSystemLegacy.EncodingType.Base64,
+      });
+      setTextAttachment({
+        kind: 'document',
+        fileName: asset.name || 'file',
+        base64: b64,
+        mimeType: asset.mimeType,
+      });
+    } catch (e) {
+      console.warn('[attach] document pick failed:', e?.message ?? e);
+    }
+  }, []);
+
+  const pickPhotoFromLibraryForText = useCallback(async () => {
+    setAttachMenuVisible(false);
+    try {
+      const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (status !== 'granted') {
+        console.warn('[attach] photo library permission denied');
+        return;
+      }
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ['images'],
+        allowsEditing: false,
+        quality: 0.9,
+        base64: true,
+      });
+      if (result.canceled || !result.assets?.[0]) return;
+      const asset = result.assets[0];
+      let b64 = asset.base64;
+      if (!b64 && asset.uri) {
+        b64 = await FileSystemLegacy.readAsStringAsync(asset.uri, {
+          encoding: FileSystemLegacy.EncodingType.Base64,
+        });
+      }
+      if (!b64) {
+        console.warn('[attach] no base64 for library image');
+        return;
+      }
+      const baseName = asset.fileName || asset.uri?.split('/').pop()?.split('?')[0] || 'photo.jpg';
+      setTextAttachment({
+        kind: 'image',
+        fileName: baseName,
+        base64: b64,
+        previewUri: asset.uri,
+      });
+    } catch (e) {
+      console.warn('[attach] library photo failed:', e?.message ?? e);
+    }
+  }, []);
+
   const playTTS = useCallback(async (text) => {
     if (!text?.trim()) return;
     let step = 'init';
@@ -776,8 +869,12 @@ export default function App() {
   }, []);
 
   const sendTextMessage = useCallback(async () => {
+    if (loading) return;
     const trimmed = (inputText || '').trim();
-    if (!trimmed || loading) return;
+    const attach = textAttachment;
+    if (!trimmed && !attach) return;
+
+    const messageText = trimmed || (attach ? DEFAULT_ATTACHMENT_MESSAGE : '');
 
     // Race fix: first GPS fix may still be in flight from mount; ref stays null until then.
     let locField = locationFieldFromRef(locationRef);
@@ -793,6 +890,91 @@ export default function App() {
       locFieldForPayload: locField,
     });
 
+    // ----- Attachments: always HTTP (no Socket.IO file channel) -----
+    if (attach) {
+      const attachSnap = attach;
+      setInputText('');
+      const userLine =
+        attachSnap.kind === 'document'
+          ? trimmed
+            ? `📄 ${attachSnap.fileName}\n${trimmed}`
+            : `📄 ${attachSnap.fileName}`
+          : trimmed
+            ? `📷 ${attachSnap.fileName}\n${trimmed}`
+            : `📷 ${attachSnap.fileName}`;
+      setMessages((prev) => [...prev, { id: makeId(), role: 'user', content: userLine }]);
+      setLoading(true);
+      setAttachmentStatus(
+        attachSnap.kind === 'document' ? 'Analyzing file…' : 'Analyzing image…'
+      );
+      try {
+        if (attachSnap.kind === 'document') {
+          const body = {
+            file_content: attachSnap.base64,
+            file_name: attachSnap.fileName,
+            context: messageText,
+            device: 'ios',
+          };
+          if (locField) body.location = locField;
+          const res = await fetch(`${API_BASE}/api/files/read`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+          });
+          const data = await res.json().catch(() => ({}));
+          console.log('[attach] /api/files/read response:', { status: res.status, data });
+          const reply = parseAngelReply(data) || (typeof data === 'string' ? data : '');
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: makeId(),
+              role: 'assistant',
+              content: reply || 'Sorry, I couldn’t read that file.',
+            },
+          ]);
+        } else {
+          const visionBody = {
+            image: attachSnap.base64,
+            question: messageText,
+            device: 'ios',
+          };
+          if (locField) visionBody.location = locField;
+          const res = await fetch(`${API_BASE}/api/vision`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(visionBody),
+          });
+          const data = await res.json().catch(() => ({}));
+          console.log('[attach] /api/vision (library) response:', { status: res.status, data });
+          const reply = parseAngelReply(data) || (typeof data === 'string' ? data : '');
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: makeId(),
+              role: 'assistant',
+              content: reply || "I couldn't interpret that image.",
+            },
+          ]);
+        }
+        setTextAttachment(null);
+      } catch (e) {
+        console.warn('[attach] upload failed:', e?.message ?? e);
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: makeId(),
+            role: 'assistant',
+            content: 'Attachment could not be sent. Please try again.',
+          },
+        ]);
+      } finally {
+        setLoading(false);
+        setAttachmentStatus(null);
+      }
+      return;
+    }
+
+    // ----- Plain text only -----
     setInputText('');
     const userMsg = { id: makeId(), role: 'user', content: trimmed };
     setMessages((prev) => [...prev, userMsg]);
@@ -848,7 +1030,7 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, [inputText, loading, refreshLocation]);
+  }, [inputText, loading, refreshLocation, textAttachment]);
 
   const startRecording = useCallback(async () => {
     try {
@@ -1143,6 +1325,47 @@ export default function App() {
               }
             />
 
+            {(attachmentStatus || textAttachment) ? (
+              <View style={styles.attachmentPreviewWrap}>
+                {attachmentStatus ? (
+                  <View style={styles.attachmentStatusRow}>
+                    <ActivityIndicator size="small" color="#A78BFA" />
+                    <Text style={styles.attachmentStatusText}>{attachmentStatus}</Text>
+                  </View>
+                ) : null}
+                {textAttachment?.kind === 'document' ? (
+                  <View style={styles.attachmentChip}>
+                    <Text style={styles.attachmentChipText} numberOfLines={1}>
+                      📄 {textAttachment.fileName}
+                    </Text>
+                    <TouchableOpacity
+                      onPress={clearTextAttachment}
+                      hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+                      accessibilityLabel="Remove attachment"
+                    >
+                      <Text style={styles.attachmentRemove}>✕</Text>
+                    </TouchableOpacity>
+                  </View>
+                ) : null}
+                {textAttachment?.kind === 'image' ? (
+                  <View style={styles.attachmentImageRow}>
+                    <Image
+                      source={{ uri: textAttachment.previewUri }}
+                      style={styles.attachmentThumb}
+                      resizeMode="cover"
+                    />
+                    <TouchableOpacity
+                      onPress={clearTextAttachment}
+                      hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+                      accessibilityLabel="Remove photo"
+                    >
+                      <Text style={styles.attachmentRemove}>✕</Text>
+                    </TouchableOpacity>
+                  </View>
+                ) : null}
+              </View>
+            ) : null}
+
             <View style={styles.inputRow}>
               <TouchableOpacity
                 style={styles.inputRowCamera}
@@ -1151,6 +1374,14 @@ export default function App() {
                 accessibilityLabel="Open camera for vision"
               >
                 <Ionicons name="camera" size={22} color="#E5E7EB" />
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.inputRowAttach}
+                onPress={() => setAttachMenuVisible(true)}
+                disabled={loading || visionSending || !!attachmentStatus}
+                accessibilityLabel="Attach file or photo"
+              >
+                <Ionicons name="attach" size={22} color="#E5E7EB" />
               </TouchableOpacity>
               <TextInput
                 style={styles.input}
@@ -1163,9 +1394,12 @@ export default function App() {
                 onSubmitEditing={sendTextMessage}
               />
               <TouchableOpacity
-                style={[styles.sendBtn, loading && styles.sendBtnDisabled]}
+                style={[
+                  styles.sendBtn,
+                  (loading || (!inputText.trim() && !textAttachment)) && styles.sendBtnDisabled,
+                ]}
                 onPress={sendTextMessage}
-                disabled={loading}
+                disabled={loading || (!inputText.trim() && !textAttachment)}
               >
                 {loading ? (
                   <ActivityIndicator size="small" color="#000" />
@@ -1253,6 +1487,43 @@ export default function App() {
             </View>
           </View>
         </KeyboardAvoidingView>
+      </Modal>
+
+      <Modal
+        visible={attachMenuVisible}
+        animationType="fade"
+        transparent
+        onRequestClose={() => setAttachMenuVisible(false)}
+      >
+        <View style={styles.attachMenuRoot}>
+          <Pressable
+            style={styles.attachMenuDim}
+            onPress={() => setAttachMenuVisible(false)}
+          />
+          <View style={styles.attachMenuCard}>
+          <Text style={styles.attachMenuTitle}>Attach</Text>
+          <TouchableOpacity
+            style={styles.attachMenuOption}
+            onPress={pickDocumentForText}
+          >
+            <Ionicons name="document-text-outline" size={22} color="#E5E7EB" />
+            <Text style={styles.attachMenuOptionText}>Choose File</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={styles.attachMenuOption}
+            onPress={pickPhotoFromLibraryForText}
+          >
+            <Ionicons name="images-outline" size={22} color="#E5E7EB" />
+            <Text style={styles.attachMenuOptionText}>Choose Photo</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={styles.attachMenuCancel}
+            onPress={() => setAttachMenuVisible(false)}
+          >
+            <Text style={styles.attachMenuCancelText}>Cancel</Text>
+          </TouchableOpacity>
+          </View>
+        </View>
       </Modal>
     </View>
   );
@@ -1421,6 +1692,98 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     marginBottom: 0,
   },
+  inputRowAttach: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: '#111827',
+    borderWidth: 1,
+    borderColor: '#1F2937',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 0,
+  },
+  attachmentPreviewWrap: {
+    paddingHorizontal: 14,
+    paddingTop: 8,
+    paddingBottom: 4,
+    borderTopWidth: 1,
+    borderTopColor: '#111827',
+    backgroundColor: '#000',
+  },
+  attachmentStatusRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    marginBottom: 8,
+  },
+  attachmentStatusText: { color: '#A78BFA', fontSize: 14, fontWeight: '600' },
+  attachmentChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: '#111827',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#1F2937',
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    gap: 8,
+  },
+  attachmentChipText: { color: '#E5E7EB', fontSize: 15, flex: 1 },
+  attachmentImageRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  attachmentThumb: {
+    width: 56,
+    height: 56,
+    borderRadius: 8,
+    backgroundColor: '#111827',
+  },
+  attachmentRemove: {
+    color: '#9CA3AF',
+    fontSize: 18,
+    fontWeight: '700',
+    paddingHorizontal: 4,
+  },
+  attachMenuRoot: {
+    flex: 1,
+    justifyContent: 'flex-end',
+    backgroundColor: 'rgba(0,0,0,0.75)',
+  },
+  attachMenuDim: {
+    ...StyleSheet.absoluteFillObject,
+  },
+  attachMenuCard: {
+    backgroundColor: '#0B0F1A',
+    borderTopLeftRadius: 16,
+    borderTopRightRadius: 16,
+    paddingHorizontal: 20,
+    paddingTop: 18,
+    paddingBottom: 28,
+    borderWidth: 1,
+    borderColor: '#1F2937',
+  },
+  attachMenuTitle: {
+    color: '#fff',
+    fontSize: 17,
+    fontWeight: '700',
+    marginBottom: 14,
+    textAlign: 'center',
+  },
+  attachMenuOption: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    paddingVertical: 14,
+    borderBottomWidth: 1,
+    borderBottomColor: '#1F2937',
+  },
+  attachMenuOptionText: { color: '#E5E7EB', fontSize: 16, fontWeight: '600' },
+  attachMenuCancel: { paddingVertical: 16, alignItems: 'center', marginTop: 4 },
+  attachMenuCancelText: { color: '#9CA3AF', fontSize: 16, fontWeight: '600' },
   input: {
     flex: 1,
     minHeight: 44,

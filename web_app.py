@@ -115,6 +115,30 @@ def api_message():
     return _handle_chat_request()
 
 
+@app.post("/api/files/read")
+def api_files_read():
+    """
+    iPhone sends JSON:
+      { "file_content": base64, "file_name": str, "context": str, "device": "ios", "location"?: {...} }
+    Decode/process file_content in your production deployment.
+    """
+    data = request.get_json(silent=True) or {}
+    context = (data.get("context") or "").strip()
+    file_name = data.get("file_name") or "attachment"
+    device = data.get("device", "")
+    location = data.get("location")
+    if not data.get("file_content"):
+        return jsonify({"error": "file_content required", "reply": ""}), 400
+    system = build_system_prompt(location)
+    user_message = (
+        f"User attached a file named {file_name!r}.\n"
+        f"Instructions / message from Tyler: {context or '(none)'}\n"
+        "The file body was sent as base64 in field file_content; decode it server-side in production."
+    )
+    reply = _generate_chat_reply(system, user_message, device)
+    return jsonify({"reply": reply, "response": reply, "text": reply})
+
+
 # --- Integrating location on your existing Railway app ---
 #
 # HTTP JSON (/api/vision):  loc = normalize_location(request.get_json(silent=True).get("location"))
