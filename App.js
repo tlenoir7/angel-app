@@ -33,9 +33,10 @@ import {
   RecordingPresets,
   setAudioModeAsync,
   AudioModule,
+  IOSOutputFormat,
+  AudioQuality,
 } from 'expo-audio';
 import * as FileSystemLegacy from 'expo-file-system/legacy';
-import { Audio } from 'expo-av';
 import { io } from 'socket.io-client';
 
 const API_BASE = 'https://web-production-0166f.up.railway.app';
@@ -47,21 +48,24 @@ const VISION_ANALYZE_QUESTION =
 /** Default context when sending an attachment with no typed message */
 const DEFAULT_ATTACHMENT_MESSAGE = 'Analyze this';
 
-/** expo-av recording: 24 kHz mono PCM16 WAV for Realtime `realtime_audio_chunk` */
+/** expo-audio: 24 kHz mono PCM16 WAV for Realtime `realtime_audio_chunk` (SDK 55–aligned; avoids legacy expo-av native headers). */
 const REALTIME_RECORDING_OPTIONS = {
   isMeteringEnabled: false,
+  extension: '.wav',
+  sampleRate: 24000,
+  numberOfChannels: 1,
+  bitRate: 384000,
   android: {
     extension: '.wav',
-    outputFormat: Audio.AndroidOutputFormat.DEFAULT,
-    audioEncoder: Audio.AndroidAudioEncoder.DEFAULT,
+    outputFormat: 'default',
+    audioEncoder: 'default',
     sampleRate: 24000,
     numberOfChannels: 1,
-    bitRate: 128000,
   },
   ios: {
     extension: '.wav',
-    outputFormat: Audio.IOSOutputFormat.LINEARPCM,
-    audioQuality: Audio.IOSAudioQuality.MAX,
+    outputFormat: IOSOutputFormat.LINEARPCM,
+    audioQuality: AudioQuality.MAX,
     sampleRate: 24000,
     numberOfChannels: 1,
     bitRate: 384000,
@@ -270,18 +274,20 @@ export default function App() {
   /** Brief status above input while uploading/analyzing attachment */
   const [attachmentStatus, setAttachmentStatus] = useState(null);
 
-  /** Voice: Standard (expo-audio / HTTP) vs GPT-4o Realtime (Socket.IO + expo-av PCM) */
+  /** Voice: Standard (expo-audio / HTTP) vs GPT-4o Realtime (Socket.IO + expo-audio PCM WAV) */
   const [voiceInputMode, setVoiceInputMode] = useState('standard');
   const [realtimeReady, setRealtimeReady] = useState(false);
   const [realtimeOrbLabel, setRealtimeOrbLabel] = useState('');
-  /** True while Realtime hold-to-speak is active (expo-av Recording); separate from expo-audio `isRecording`. */
+  /** True while Realtime hold-to-speak is active (second `AudioRecorder`); separate from Standard `isRecording`. */
   const [rtHolding, setRtHolding] = useState(false);
 
-  const realtimeRecordingRef = useRef(null);
   const realtimeChunkIntervalRef = useRef(null);
   const realtimePcmSentRef = useRef(0);
   const realtimeResponsePcmRef = useRef([]);
-  const realtimeSoundRef = useRef(null);
+  /** Latest `AudioPlayer` for Realtime TTS-style PCM playback (WAV file URI). */
+  const realtimeResponsePlayerRef = useRef(null);
+  /** Latest Realtime `AudioRecorder` for socket cleanup / chunk loop. */
+  const realtimeAudioRecorderRef = useRef(null);
   /** Set after `cleanupRealtimeRecording` is defined each render (socket handlers call latest cleanup). */
   const cleanupRealtimeRecordingRef = useRef(() => {});
   const voiceInputModeRef = useRef('standard');
@@ -358,7 +364,15 @@ export default function App() {
   // SDK 55: call with no args when source is set later via replace() (avoids native ctor mismatch)
   const ttsPlayer = useAudioPlayer();
   const ttsStatus = useAudioPlayerStatus(ttsPlayer);
+  /** Separate player for OpenAI Realtime assistant PCM (WAV) — keeps TTS and Realtime playback independent. */
+  const realtimeResponsePlayer = useAudioPlayer(null);
+  const realtimeResponseStatus = useAudioPlayerStatus(realtimeResponsePlayer);
+  realtimeResponsePlayerRef.current = realtimeResponsePlayer;
+
   const audioRecorder = useAudioRecorder(RecordingPresets.HIGH_QUALITY);
+  const realtimeAudioRecorder = useAudioRecorder(REALTIME_RECORDING_OPTIONS);
+  realtimeAudioRecorderRef.current = realtimeAudioRecorder;
+
   const recorderState = useAudioRecorderState(audioRecorder);
   const isRecording = recorderState?.isRecording ?? false;
 
@@ -372,6 +386,19 @@ export default function App() {
       console.log('[TTS] step: playback finished (expo-audio), orb idle');
     }
   }, [ttsStatus?.playing]);
+
+  const wasPlayingRealtimeResponseRef = useRef(false);
+  useEffect(() => {
+    if (realtimeResponseStatus?.playing) {
+      wasPlayingRealtimeResponseRef.current = true;
+    } else if (wasPlayingRealtimeResponseRef.current) {
+      wasPlayingRealtimeResponseRef.current = false;
+      setOrbState('idle');
+      if (voiceInputModeRef.current === 'realtime') {
+        setRealtimeOrbLabel('Listening…');
+      }
+    }
+  }, [realtimeResponseStatus?.playing]);
 
   const modeAnim = useRef(new Animated.Value(0)).current; // 0 voice, 1 text
 
@@ -979,29 +1006,19 @@ export default function App() {
       await FileSystemLegacy.writeAsStringAsync(uri, uint8ArrayToBase64(wav), {
         encoding: FileSystemLegacy.EncodingType.Base64,
       });
-      await Audio.setAudioModeAsync({
+      await setAudioModeAsync({
+        allowsRecording: false,
         playsInSilentMode: true,
-        allowsRecordingIOS: false,
+        interruptionMode: 'duckOthers',
+        shouldPlayInBackground: false,
+        shouldRouteThroughEarpiece: false,
       });
-      if (realtimeSoundRef.current) {
-        try {
-          await realtimeSoundRef.current.unloadAsync();
-        } catch (_) {}
-        realtimeSoundRef.current = null;
-      }
-      const { sound } = await Audio.Sound.createAsync({ uri });
-      realtimeSoundRef.current = sound;
+      const player = realtimeResponsePlayerRef.current;
+      if (!player) return;
+      player.replace({ uri });
       setOrbState('speaking');
       setRealtimeOrbLabel('Speaking…');
-      sound.setOnPlaybackStatusUpdate((st) => {
-        if (st.isLoaded && st.didJustFinish) {
-          setOrbState('idle');
-          if (voiceInputModeRef.current === 'realtime') {
-            setRealtimeOrbLabel('Listening…');
-          }
-        }
-      });
-      await sound.playAsync();
+      player.play();
     };
 
     const onRealtimeReady = () => {
@@ -1091,10 +1108,9 @@ export default function App() {
         realtimeChunkIntervalRef.current = null;
       }
       realtimePcmSentRef.current = 0;
-      const rrec = realtimeRecordingRef.current;
-      if (rrec) {
-        rrec.stopAndUnloadAsync().catch(() => {});
-        realtimeRecordingRef.current = null;
+      const rrec = realtimeAudioRecorderRef.current;
+      if (rrec?.isRecording) {
+        rrec.stop().catch(() => {});
       }
       socket.off('connect', onConnect);
       socket.off('disconnect', onDisconnect);
@@ -1325,10 +1341,9 @@ export default function App() {
       realtimeChunkIntervalRef.current = null;
     }
     realtimePcmSentRef.current = 0;
-    const rec = realtimeRecordingRef.current;
-    if (rec) {
-      rec.stopAndUnloadAsync().catch(() => {});
-      realtimeRecordingRef.current = null;
+    const rec = realtimeAudioRecorderRef.current;
+    if (rec?.isRecording) {
+      rec.stop().catch(() => {});
     }
     setRtHolding(false);
   }, []);
@@ -1384,30 +1399,29 @@ export default function App() {
         setOrbState('listening');
         setRealtimeOrbLabel('Listening…');
 
-        const { status } = await Audio.requestPermissionsAsync();
-        if (status !== 'granted') {
+        const perm = await AudioModule.requestRecordingPermissionsAsync();
+        if (!perm?.granted) {
           setOrbState('idle');
           Alert.alert('Microphone', 'Permission is required for Realtime voice.');
           return;
         }
 
-        await Audio.setAudioModeAsync({
-          allowsRecordingIOS: true,
-          playsInSilentModeIOS: true,
+        await setAudioModeAsync({
+          allowsRecording: true,
+          playsInSilentMode: true,
+          interruptionMode: 'duckOthers',
+          shouldPlayInBackground: false,
+          shouldRouteThroughEarpiece: false,
         });
 
         cleanupRealtimeRecording();
-        const recording = new Audio.Recording();
-        await recording.prepareToRecordAsync(REALTIME_RECORDING_OPTIONS);
-        await recording.startAsync();
-        realtimeRecordingRef.current = recording;
+        await realtimeAudioRecorder.prepareToRecordAsync();
+        realtimeAudioRecorder.record();
         realtimePcmSentRef.current = 0;
         setRtHolding(true);
 
         realtimeChunkIntervalRef.current = setInterval(async () => {
-          const rec = realtimeRecordingRef.current;
-          if (!rec) return;
-          const uri = rec.getURI();
+          const uri = realtimeAudioRecorderRef.current?.uri;
           if (!uri) return;
           try {
             const b64 = await FileSystemLegacy.readAsStringAsync(uri, {
@@ -1449,7 +1463,14 @@ export default function App() {
     } catch (_) {
       setOrbState('idle');
     }
-  }, [loading, audioRecorder, voiceInputMode, realtimeReady, cleanupRealtimeRecording]);
+  }, [
+    loading,
+    audioRecorder,
+    voiceInputMode,
+    realtimeReady,
+    cleanupRealtimeRecording,
+    realtimeAudioRecorder,
+  ]);
 
   const stopRecording = useCallback(async () => {
     if (voiceInputMode === 'realtime') {

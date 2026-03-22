@@ -21,12 +21,7 @@
         "NSPhotoLibraryUsageDescription": "Angel can attach photos from your library to your messages.",
         "UIFileSharingEnabled": true,
         "LSSupportsOpeningDocumentsInPlace": true,
-        "UIBackgroundModes": [
-          "audio",
-          "remote-notification",
-          "audio",
-          "remote-notification"
-        ],
+        "UIBackgroundModes": ["audio", "remote-notification"],
         "ITSAppUsesNonExemptEncryption": false
       }
     },
