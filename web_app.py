@@ -9,11 +9,18 @@ Legacy clients may use /api/message (same handler). Location may use "place_name
 
 from __future__ import annotations
 
+import base64
 import json
 import os
+from io import BytesIO
 from typing import Any
 
 from flask import Flask, request, jsonify
+
+try:
+    from pypdf import PdfReader
+except ImportError:
+    PdfReader = None  # type: ignore
 
 app = Flask(__name__)
 
@@ -57,6 +64,36 @@ def build_system_prompt(location: Any = None) -> str:
             "If you are unsure, say so; do not invent specific venues from coordinates alone."
         )
     return "\n".join(lines)
+
+
+def _extract_text_from_upload(file_name: str, raw: bytes) -> str:
+    """Best-effort text extraction for PDF and plain-text-like files."""
+    name = (file_name or "").lower()
+    if name.endswith(".pdf"):
+        if PdfReader is None:
+            return (
+                "[PDF attached but pypdf is not installed on the server. "
+                "Add pypdf to requirements.txt and redeploy.]"
+            )
+        try:
+            reader = PdfReader(BytesIO(raw))
+            parts: list[str] = []
+            for page in reader.pages:
+                parts.append(page.extract_text() or "")
+            text = "\n".join(parts).strip()
+            if not text:
+                return (
+                    "[PDF opened but no text was extracted — it may be scanned images only. "
+                    "Try OCR or a text-based PDF.]"
+                )
+            return text
+        except Exception as e:
+            return f"[Could not read PDF: {e}]"
+    # Plain text / code / csv
+    try:
+        return raw.decode("utf-8", errors="replace")
+    except Exception:
+        return "[Binary file — decode as UTF-8 failed.]"
 
 
 def _generate_chat_reply(system_prompt: str, user_message: str, device: str) -> str:
@@ -120,20 +157,34 @@ def api_files_read():
     """
     iPhone sends JSON:
       { "file_content": base64, "file_name": str, "context": str, "device": "ios", "location"?: {...} }
-    Decode/process file_content in your production deployment.
     """
     data = request.get_json(silent=True) or {}
     context = (data.get("context") or "").strip()
     file_name = data.get("file_name") or "attachment"
     device = data.get("device", "")
     location = data.get("location")
-    if not data.get("file_content"):
-        return jsonify({"error": "file_content required", "reply": ""}), 400
+    b64 = data.get("file_content")
+    if not b64 or not isinstance(b64, str):
+        return jsonify({"error": "file_content required (base64 string)", "reply": ""}), 400
+    try:
+        raw = base64.b64decode(b64, validate=False)
+    except Exception as e:
+        return jsonify({"error": f"invalid base64: {e}", "reply": ""}), 400
+    if len(raw) == 0:
+        return jsonify({"error": "decoded file is empty", "reply": ""}), 400
+
+    extracted = _extract_text_from_upload(file_name, raw)
+    # Cap size sent to the model (very large PDFs / logs)
+    max_chars = int(os.environ.get("FILE_EXTRACT_MAX_CHARS", "120000"))
+    if len(extracted) > max_chars:
+        extracted = extracted[:max_chars] + "\n\n[…truncated for length]"
+
     system = build_system_prompt(location)
     user_message = (
-        f"User attached a file named {file_name!r}.\n"
-        f"Instructions / message from Tyler: {context or '(none)'}\n"
-        "The file body was sent as base64 in field file_content; decode it server-side in production."
+        f"Tyler attached file {file_name!r}.\n"
+        f"Tyler's instructions: {context or '(none)'}\n\n"
+        f"--- File content (extracted) ---\n{extracted}\n--- End ---\n\n"
+        "Summarize and answer based on this content and Tyler's instructions."
     )
     reply = _generate_chat_reply(system, user_message, device)
     return jsonify({"reply": reply, "response": reply, "text": reply})

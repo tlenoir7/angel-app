@@ -35,6 +35,7 @@ import {
   AudioModule,
 } from 'expo-audio';
 import * as FileSystemLegacy from 'expo-file-system/legacy';
+import { Audio } from 'expo-av';
 import { io } from 'socket.io-client';
 
 const API_BASE = 'https://web-production-0166f.up.railway.app';
@@ -46,6 +47,31 @@ const VISION_ANALYZE_QUESTION =
 /** Default context when sending an attachment with no typed message */
 const DEFAULT_ATTACHMENT_MESSAGE = 'Analyze this';
 
+/** expo-av recording: 24 kHz mono PCM16 WAV for Realtime `realtime_audio_chunk` */
+const REALTIME_RECORDING_OPTIONS = {
+  isMeteringEnabled: false,
+  android: {
+    extension: '.wav',
+    outputFormat: Audio.AndroidOutputFormat.DEFAULT,
+    audioEncoder: Audio.AndroidAudioEncoder.DEFAULT,
+    sampleRate: 24000,
+    numberOfChannels: 1,
+    bitRate: 128000,
+  },
+  ios: {
+    extension: '.wav',
+    outputFormat: Audio.IOSOutputFormat.LINEARPCM,
+    audioQuality: Audio.IOSAudioQuality.MAX,
+    sampleRate: 24000,
+    numberOfChannels: 1,
+    bitRate: 384000,
+    linearPCMBitDepth: 16,
+    linearPCMIsBigEndian: false,
+    linearPCMIsFloat: false,
+  },
+  web: { mimeType: 'audio/wav', bitsPerSecond: 384000 },
+};
+
 Notifications.setNotificationHandler({
   handleNotification: async () => ({
     shouldPlaySound: true,
@@ -55,6 +81,64 @@ Notifications.setNotificationHandler({
     shouldAnimate: true,
   }),
 });
+
+function uint8ArrayToBase64(u8) {
+  return arrayBufferToBase64(u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength));
+}
+
+function base64ToUint8Array(b64) {
+  if (typeof atob === 'undefined') {
+    throw new Error('base64 decode requires atob');
+  }
+  const bin = atob(b64);
+  const arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  return arr;
+}
+
+/** New PCM bytes in a growing WAV file (fixed 44-byte PCM header). */
+function extractNewPcmFromWavFile(fullBytes, sentOffset) {
+  const WAV_HEADER = 44;
+  if (fullBytes.length <= WAV_HEADER) {
+    return { chunk: new Uint8Array(0), nextOffset: 0 };
+  }
+  const pcm = fullBytes.slice(WAV_HEADER);
+  if (sentOffset >= pcm.length) {
+    return { chunk: new Uint8Array(0), nextOffset: sentOffset };
+  }
+  const chunk = pcm.slice(sentOffset);
+  return { chunk, nextOffset: pcm.length };
+}
+
+/** Build WAV container for raw PCM16 mono (e.g. OpenAI Realtime playback). */
+function buildWavFromPcm16(pcmData, sampleRate) {
+  const numChannels = 1;
+  const bitsPerSample = 16;
+  const blockAlign = (numChannels * bitsPerSample) / 8;
+  const byteRate = sampleRate * blockAlign;
+  const dataSize = pcmData.length;
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+  const w = (o, s) => {
+    for (let i = 0; i < s.length; i++) view.setUint8(o + i, s.charCodeAt(i));
+  };
+  w(0, 'RIFF');
+  view.setUint32(4, 36 + dataSize, true);
+  w(8, 'WAVE');
+  w(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, numChannels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, byteRate, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, bitsPerSample, true);
+  w(36, 'data');
+  view.setUint32(40, dataSize, true);
+  const out = new Uint8Array(buffer);
+  out.set(pcmData, 44);
+  return out;
+}
 
 function arrayBufferToBase64(buffer) {
   const bytes = new Uint8Array(buffer);
@@ -186,6 +270,26 @@ export default function App() {
   /** Brief status above input while uploading/analyzing attachment */
   const [attachmentStatus, setAttachmentStatus] = useState(null);
 
+  /** Voice: Standard (expo-audio / HTTP) vs GPT-4o Realtime (Socket.IO + expo-av PCM) */
+  const [voiceInputMode, setVoiceInputMode] = useState('standard');
+  const [realtimeReady, setRealtimeReady] = useState(false);
+  const [realtimeOrbLabel, setRealtimeOrbLabel] = useState('');
+  /** True while Realtime hold-to-speak is active (expo-av Recording); separate from expo-audio `isRecording`. */
+  const [rtHolding, setRtHolding] = useState(false);
+
+  const realtimeRecordingRef = useRef(null);
+  const realtimeChunkIntervalRef = useRef(null);
+  const realtimePcmSentRef = useRef(0);
+  const realtimeResponsePcmRef = useRef([]);
+  const realtimeSoundRef = useRef(null);
+  /** Set after `cleanupRealtimeRecording` is defined each render (socket handlers call latest cleanup). */
+  const cleanupRealtimeRecordingRef = useRef(() => {});
+  const voiceInputModeRef = useRef('standard');
+
+  useEffect(() => {
+    voiceInputModeRef.current = voiceInputMode;
+  }, [voiceInputMode]);
+
   useEffect(() => {
     modeRef.current = mode;
   }, [mode]);
@@ -276,8 +380,8 @@ export default function App() {
   const ripple = useRef(new Animated.Value(0)).current;
   const focus = useRef(new Animated.Value(0)).current; // listening intensity
 
-  const glowColor = '#6D28FF'; // deep purple
-  const glowColor2 = '#2563FF'; // deep blue
+  const glowColor = voiceInputMode === 'realtime' ? '#06B6D4' : '#6D28FF'; // cyan vs deep purple
+  const glowColor2 = voiceInputMode === 'realtime' ? '#0891B2' : '#2563FF'; // cyan vs deep blue
 
   // Smooth slide between modes
   useEffect(() => {
@@ -776,6 +880,14 @@ export default function App() {
     };
     const onDisconnect = (reason) => {
       setSocketConnected(false);
+      if (voiceInputModeRef.current === 'realtime') {
+        try {
+          cleanupRealtimeRecordingRef.current?.();
+        } catch (_) {}
+        setVoiceInputMode('standard');
+        setRealtimeReady(false);
+        setRealtimeOrbLabel('');
+      }
       if (expectingResponseRef.current) {
         expectingResponseRef.current = false;
         setLoading(false);
@@ -849,12 +961,107 @@ export default function App() {
       }
     };
 
+    const mergeRealtimePlayback = async () => {
+      const chunks = realtimeResponsePcmRef.current;
+      realtimeResponsePcmRef.current = [];
+      if (!chunks.length) return;
+      const parts = chunks.map((c) => base64ToUint8Array(c));
+      let total = 0;
+      for (const p of parts) total += p.length;
+      const merged = new Uint8Array(total);
+      let offset = 0;
+      for (const p of parts) {
+        merged.set(p, offset);
+        offset += p.length;
+      }
+      const wav = buildWavFromPcm16(merged, 24000);
+      const uri = FileSystemLegacy.cacheDirectory + 'rt_play_' + Date.now() + '.wav';
+      await FileSystemLegacy.writeAsStringAsync(uri, uint8ArrayToBase64(wav), {
+        encoding: FileSystemLegacy.EncodingType.Base64,
+      });
+      await Audio.setAudioModeAsync({
+        playsInSilentMode: true,
+        allowsRecordingIOS: false,
+      });
+      if (realtimeSoundRef.current) {
+        try {
+          await realtimeSoundRef.current.unloadAsync();
+        } catch (_) {}
+        realtimeSoundRef.current = null;
+      }
+      const { sound } = await Audio.Sound.createAsync({ uri });
+      realtimeSoundRef.current = sound;
+      setOrbState('speaking');
+      setRealtimeOrbLabel('Speaking…');
+      sound.setOnPlaybackStatusUpdate((st) => {
+        if (st.isLoaded && st.didJustFinish) {
+          setOrbState('idle');
+          if (voiceInputModeRef.current === 'realtime') {
+            setRealtimeOrbLabel('Listening…');
+          }
+        }
+      });
+      await sound.playAsync();
+    };
+
+    const onRealtimeReady = () => {
+      setRealtimeReady(true);
+      setRealtimeOrbLabel('Listening…');
+    };
+    const onRealtimeAudioResponse = (payload) => {
+      const b64 = payload?.audio_b64;
+      if (typeof b64 === 'string' && b64.length) {
+        realtimeResponsePcmRef.current.push(b64);
+      }
+    };
+    const onRealtimeAudioDone = () => {
+      mergeRealtimePlayback().catch((e) =>
+        console.warn('[realtime] playback failed:', e?.message ?? e)
+      );
+    };
+    const onRealtimeTranscript = (p) => {
+      if (!p || !p.done) return;
+      const text = p.transcript != null ? String(p.transcript).trim() : '';
+      if (!text) return;
+      const role = p.role === 'assistant' ? 'assistant' : 'user';
+      setMessages((prev) => [...prev, { id: makeId(), role, content: text }]);
+    };
+    const onRealtimeSpeechDetected = () => setRealtimeOrbLabel('Hearing you…');
+    const onRealtimeProcessing = () => setRealtimeOrbLabel('Processing…');
+    const onRealtimeError = (payload) => {
+      const msg = payload?.message ?? 'Realtime error';
+      console.warn('[realtime] error', payload);
+      try {
+        cleanupRealtimeRecordingRef.current?.();
+      } catch (_) {}
+      Alert.alert('Realtime', msg);
+      setVoiceInputMode('standard');
+      setRealtimeReady(false);
+      setRealtimeOrbLabel('');
+      setOrbState('idle');
+    };
+    const onRealtimeEnded = () => {
+      setRealtimeReady(false);
+      setRealtimeOrbLabel('');
+      try {
+        cleanupRealtimeRecordingRef.current?.();
+      } catch (_) {}
+    };
+
     socket.on('connect', onConnect);
     socket.on('disconnect', onDisconnect);
     socket.on('connect_error', onConnectError);
     socket.on('angel_thinking', onAngelThinking);
     socket.on('angel_transcript', onAngelTranscript);
     socket.on('angel_response', onAngelResponse);
+    socket.on('realtime_ready', onRealtimeReady);
+    socket.on('realtime_audio_response', onRealtimeAudioResponse);
+    socket.on('realtime_audio_done', onRealtimeAudioDone);
+    socket.on('realtime_transcript', onRealtimeTranscript);
+    socket.on('realtime_speech_detected', onRealtimeSpeechDetected);
+    socket.on('realtime_processing', onRealtimeProcessing);
+    socket.on('realtime_error', onRealtimeError);
+    socket.on('realtime_ended', onRealtimeEnded);
 
     const mgr = socket.io;
     const onReconnectAttempt = (n) => {
@@ -879,12 +1086,30 @@ export default function App() {
     mgr.on('reconnect_failed', onReconnectFailed);
 
     return () => {
+      if (realtimeChunkIntervalRef.current) {
+        clearInterval(realtimeChunkIntervalRef.current);
+        realtimeChunkIntervalRef.current = null;
+      }
+      realtimePcmSentRef.current = 0;
+      const rrec = realtimeRecordingRef.current;
+      if (rrec) {
+        rrec.stopAndUnloadAsync().catch(() => {});
+        realtimeRecordingRef.current = null;
+      }
       socket.off('connect', onConnect);
       socket.off('disconnect', onDisconnect);
       socket.off('connect_error', onConnectError);
       socket.off('angel_thinking', onAngelThinking);
       socket.off('angel_transcript', onAngelTranscript);
       socket.off('angel_response', onAngelResponse);
+      socket.off('realtime_ready', onRealtimeReady);
+      socket.off('realtime_audio_response', onRealtimeAudioResponse);
+      socket.off('realtime_audio_done', onRealtimeAudioDone);
+      socket.off('realtime_transcript', onRealtimeTranscript);
+      socket.off('realtime_speech_detected', onRealtimeSpeechDetected);
+      socket.off('realtime_processing', onRealtimeProcessing);
+      socket.off('realtime_error', onRealtimeError);
+      socket.off('realtime_ended', onRealtimeEnded);
       mgr.off('reconnect_attempt', onReconnectAttempt);
       mgr.off('reconnect', onReconnect);
       mgr.off('reconnect_error', onReconnectError);
@@ -944,20 +1169,54 @@ export default function App() {
             device: 'ios',
           };
           if (locField) body.location = locField;
+          const fc = body.file_content;
+          const fcStr = typeof fc === 'string' ? fc : '';
+          console.log('[attach] /api/files/read REQUEST (pre-fetch)', {
+            url: `${API_BASE}/api/files/read`,
+            headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+            file_name: body.file_name,
+            context: body.context,
+            device: body.device,
+            has_location: !!body.location,
+            file_content_type: typeof fc,
+            file_content_length: fcStr.length,
+            file_content_prefix: fcStr.slice(0, 120),
+          });
           const res = await fetch(`${API_BASE}/api/files/read`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: {
+              'Content-Type': 'application/json',
+              Accept: 'application/json',
+            },
             body: JSON.stringify(body),
           });
-          const data = await res.json().catch(() => ({}));
-          console.log('[attach] /api/files/read response:', { status: res.status, data });
+          const rawText = await res.text();
+          console.log('[attach] /api/files/read RAW response', {
+            status: res.status,
+            ok: res.ok,
+            rawText:
+              rawText.length > 4000 ? `${rawText.slice(0, 4000)}… (${rawText.length} chars)` : rawText,
+          });
+          let data = {};
+          try {
+            data = rawText ? JSON.parse(rawText) : {};
+          } catch (parseErr) {
+            console.warn('[attach] /api/files/read JSON parse failed:', parseErr?.message ?? parseErr);
+          }
+          console.log('[attach] /api/files/read parsed:', data);
           const reply = parseAngelReply(data) || (typeof data === 'string' ? data : '');
+          const errMsg = data?.error != null ? String(data.error) : '';
+          const assistantText =
+            reply ||
+            (!res.ok && errMsg ? errMsg : '') ||
+            (!res.ok ? `HTTP ${res.status}` : '') ||
+            'Sorry, I couldn’t read that file.';
           setMessages((prev) => [
             ...prev,
             {
               id: makeId(),
               role: 'assistant',
-              content: reply || 'Sorry, I couldn’t read that file.',
+              content: assistantText,
             },
           ]);
         } else {
@@ -1060,9 +1319,117 @@ export default function App() {
     }
   }, [inputText, loading, refreshLocation, textAttachment]);
 
+  const cleanupRealtimeRecording = useCallback(() => {
+    if (realtimeChunkIntervalRef.current) {
+      clearInterval(realtimeChunkIntervalRef.current);
+      realtimeChunkIntervalRef.current = null;
+    }
+    realtimePcmSentRef.current = 0;
+    const rec = realtimeRecordingRef.current;
+    if (rec) {
+      rec.stopAndUnloadAsync().catch(() => {});
+      realtimeRecordingRef.current = null;
+    }
+    setRtHolding(false);
+  }, []);
+
+  cleanupRealtimeRecordingRef.current = cleanupRealtimeRecording;
+
+  useEffect(() => {
+    if (mode !== 'text') return;
+    if (voiceInputModeRef.current !== 'realtime') return;
+    socketRef.current?.emit('realtime_stop');
+    cleanupRealtimeRecording();
+    setVoiceInputMode('standard');
+    setRealtimeReady(false);
+    setRealtimeOrbLabel('');
+  }, [mode, cleanupRealtimeRecording]);
+
+  const selectVoiceInputMode = useCallback(
+    (next) => {
+      if (next === 'standard') {
+        socketRef.current?.emit('realtime_stop');
+        cleanupRealtimeRecording();
+        setVoiceInputMode('standard');
+        setRealtimeReady(false);
+        setRealtimeOrbLabel('');
+        return;
+      }
+      if (!socketRef.current?.connected) {
+        Alert.alert('Realtime', 'Connect to the server first (green dot).');
+        return;
+      }
+      setVoiceInputMode('realtime');
+      setRealtimeReady(false);
+      setRealtimeOrbLabel('Connecting…');
+      socketRef.current.emit('realtime_start');
+    },
+    [cleanupRealtimeRecording]
+  );
+
   const startRecording = useCallback(async () => {
     try {
       if (loading) return;
+
+      if (voiceInputMode === 'realtime') {
+        if (!socketRef.current?.connected) {
+          Alert.alert('Realtime', 'Connect to the server first (green dot).');
+          return;
+        }
+        if (!realtimeReady) {
+          setRealtimeOrbLabel('Connecting…');
+          return;
+        }
+
+        setOrbState('listening');
+        setRealtimeOrbLabel('Listening…');
+
+        const { status } = await Audio.requestPermissionsAsync();
+        if (status !== 'granted') {
+          setOrbState('idle');
+          Alert.alert('Microphone', 'Permission is required for Realtime voice.');
+          return;
+        }
+
+        await Audio.setAudioModeAsync({
+          allowsRecordingIOS: true,
+          playsInSilentModeIOS: true,
+        });
+
+        cleanupRealtimeRecording();
+        const recording = new Audio.Recording();
+        await recording.prepareToRecordAsync(REALTIME_RECORDING_OPTIONS);
+        await recording.startAsync();
+        realtimeRecordingRef.current = recording;
+        realtimePcmSentRef.current = 0;
+        setRtHolding(true);
+
+        realtimeChunkIntervalRef.current = setInterval(async () => {
+          const rec = realtimeRecordingRef.current;
+          if (!rec) return;
+          const uri = rec.getURI();
+          if (!uri) return;
+          try {
+            const b64 = await FileSystemLegacy.readAsStringAsync(uri, {
+              encoding: FileSystemLegacy.EncodingType.Base64,
+            });
+            const fullBytes = base64ToUint8Array(b64);
+            const { chunk, nextOffset } = extractNewPcmFromWavFile(
+              fullBytes,
+              realtimePcmSentRef.current
+            );
+            realtimePcmSentRef.current = nextOffset;
+            if (chunk.length > 0) {
+              const pcmB64 = uint8ArrayToBase64(chunk);
+              socketRef.current?.emit('realtime_audio_chunk', { audio_b64: pcmB64 });
+            }
+          } catch (e) {
+            console.warn('[realtime] chunk:', e?.message ?? e);
+          }
+        }, 500);
+        return;
+      }
+
       setOrbState('listening');
 
       const perm = await AudioModule.requestRecordingPermissionsAsync();
@@ -1082,9 +1449,18 @@ export default function App() {
     } catch (_) {
       setOrbState('idle');
     }
-  }, [loading, audioRecorder]);
+  }, [loading, audioRecorder, voiceInputMode, realtimeReady, cleanupRealtimeRecording]);
 
   const stopRecording = useCallback(async () => {
+    if (voiceInputMode === 'realtime') {
+      cleanupRealtimeRecording();
+      setOrbState('idle');
+      if (realtimeReady) {
+        setRealtimeOrbLabel('Listening…');
+      }
+      return;
+    }
+
     if (!recorderState?.isRecording) {
       setOrbState('idle');
       return;
@@ -1174,7 +1550,14 @@ export default function App() {
         setLoading(false);
       }
     }
-  }, [recorderState?.isRecording, audioRecorder, playTTS]);
+  }, [
+    voiceInputMode,
+    cleanupRealtimeRecording,
+    realtimeReady,
+    recorderState?.isRecording,
+    audioRecorder,
+    playTTS,
+  ]);
 
   const orbScale = useMemo(() => {
     const idleS = idlePulse.interpolate({ inputRange: [0, 1], outputRange: [1, 1.05] });
@@ -1201,6 +1584,29 @@ export default function App() {
     if (!layoutWidth) return modeAnim.interpolate({ inputRange: [0, 1], outputRange: [0, -360] });
     return modeAnim.interpolate({ inputRange: [0, 1], outputRange: [0, -layoutWidth] });
   }, [layoutWidth, modeAnim]);
+
+  const voiceHintText = useMemo(() => {
+    if (voiceInputMode === 'realtime') {
+      if (!socketConnected) return 'Connect to use Realtime.';
+      if (!realtimeReady) return realtimeOrbLabel || 'Connecting…';
+    }
+    if (loading) return socketConnected ? 'Angel is thinking…' : 'Connecting…';
+    if (voiceInputMode === 'realtime' && realtimeOrbLabel) return realtimeOrbLabel;
+    if (orbState === 'speaking') {
+      return voiceInputMode === 'realtime' ? 'Speaking…' : 'Angel is speaking…';
+    }
+    if (isRecording || rtHolding) return 'Listening…';
+    return 'Hold to speak';
+  }, [
+    voiceInputMode,
+    socketConnected,
+    realtimeReady,
+    realtimeOrbLabel,
+    loading,
+    orbState,
+    isRecording,
+    rtHolding,
+  ]);
 
   const renderMessage = useCallback(({ item }) => {
     const isUser = item.role === 'user';
@@ -1258,6 +1664,45 @@ export default function App() {
             <View style={styles.voiceCenter}>
             <Text style={styles.voiceName}>Angel</Text>
 
+            <View style={styles.voiceModeRow}>
+              <TouchableOpacity
+                style={[
+                  styles.voiceModeBtn,
+                  voiceInputMode === 'standard' && styles.voiceModeBtnActive,
+                ]}
+                onPress={() => selectVoiceInputMode('standard')}
+                disabled={loading}
+              >
+                <Text
+                  style={[
+                    styles.voiceModeBtnText,
+                    voiceInputMode === 'standard' && styles.voiceModeBtnTextActive,
+                  ]}
+                >
+                  Standard
+                </Text>
+              </TouchableOpacity>
+              {socketConnected ? (
+                <TouchableOpacity
+                  style={[
+                    styles.voiceModeBtn,
+                    voiceInputMode === 'realtime' && styles.voiceModeBtnActiveRealtime,
+                  ]}
+                  onPress={() => selectVoiceInputMode('realtime')}
+                  disabled={loading}
+                >
+                  <Text
+                    style={[
+                      styles.voiceModeBtnText,
+                      voiceInputMode === 'realtime' && styles.voiceModeBtnTextActiveRealtime,
+                    ]}
+                  >
+                    Realtime
+                  </Text>
+                </TouchableOpacity>
+              ) : null}
+            </View>
+
             <View style={styles.orbWrap}>
               {/* Ripple ring when speaking */}
               <Animated.View
@@ -1304,24 +1749,19 @@ export default function App() {
               </Animated.View>
             </View>
 
-            <Text style={styles.voiceHint}>
-              {loading
-                ? socketConnected
-                  ? 'Angel is thinking…'
-                  : 'Connecting…'
-                : orbState === 'speaking'
-                  ? 'Angel is speaking…'
-                  : isRecording
-                    ? 'Listening…'
-                    : 'Hold to speak'}
-            </Text>
+            <Text style={styles.voiceHint}>{voiceHintText}</Text>
 
             <Pressable
-              style={[styles.holdToSpeak, isRecording && styles.holdToSpeakActive]}
+              style={[
+                styles.holdToSpeak,
+                (isRecording || rtHolding) && styles.holdToSpeakActive,
+              ]}
               onPressIn={startRecording}
               onPressOut={stopRecording}
             >
-              <Text style={styles.holdToSpeakText}>{isRecording ? 'Release' : 'Hold'}</Text>
+              <Text style={styles.holdToSpeakText}>
+                {isRecording || rtHolding ? 'Release' : 'Hold'}
+              </Text>
             </Pressable>
             </View>
             <View style={styles.voiceBottomBar}>
@@ -1619,7 +2059,33 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
-  voiceName: { color: '#fff', fontSize: 22, fontWeight: '600', marginBottom: 22 },
+  voiceName: { color: '#fff', fontSize: 22, fontWeight: '600', marginBottom: 12 },
+  voiceModeRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 10,
+    marginBottom: 18,
+  },
+  voiceModeBtn: {
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 20,
+    backgroundColor: '#111827',
+    borderWidth: 1,
+    borderColor: '#1F2937',
+  },
+  voiceModeBtnActive: {
+    borderColor: '#6D28FF',
+    backgroundColor: '#1E1B4B',
+  },
+  voiceModeBtnActiveRealtime: {
+    borderColor: '#06B6D4',
+    backgroundColor: '#083344',
+  },
+  voiceModeBtnText: { color: '#9CA3AF', fontSize: 13, fontWeight: '600' },
+  voiceModeBtnTextActive: { color: '#E9D5FF' },
+  voiceModeBtnTextActiveRealtime: { color: '#A5F3FC' },
   orbWrap: { alignItems: 'center', justifyContent: 'center', marginBottom: 22 },
   rippleRing: {
     position: 'absolute',
