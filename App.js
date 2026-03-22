@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Alert,
   Animated,
   Easing,
   FlatList,
@@ -44,23 +45,6 @@ const VISION_ANALYZE_QUESTION =
   'What do you see? Describe everything relevant to my mission.';
 /** Default context when sending an attachment with no typed message */
 const DEFAULT_ATTACHMENT_MESSAGE = 'Analyze this';
-
-/** MIME types for document picker (PDF, Office, text, common code) */
-const DOCUMENT_PICKER_TYPES = [
-  'application/pdf',
-  'application/msword',
-  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-  'text/csv',
-  'text/plain',
-  'text/html',
-  'text/javascript',
-  'application/json',
-  'text/x-python',
-  'text/x-java-source',
-  'text/x-c',
-  'application/xml',
-  'text/xml',
-];
 
 Notifications.setNotificationHandler({
   handleNotification: async () => ({
@@ -520,12 +504,22 @@ export default function App() {
   const pickDocumentForText = useCallback(async () => {
     setAttachMenuVisible(false);
     try {
+      // iOS: use */* so UIDocumentPicker can show Files / iCloud / providers; narrow MIME lists often break browsing.
       const result = await DocumentPicker.getDocumentAsync({
+        type: ['*/*'],
         copyToCacheDirectory: true,
-        type: DOCUMENT_PICKER_TYPES,
         multiple: false,
       });
-      if (result.canceled || !result.assets?.[0]) return;
+      if (result.canceled) {
+        return;
+      }
+      if (!result.assets?.[0]) {
+        Alert.alert(
+          'No file selected',
+          'Choose a document from Files, iCloud Drive, or another location.'
+        );
+        return;
+      }
       const asset = result.assets[0];
       const b64 = await FileSystemLegacy.readAsStringAsync(asset.uri, {
         encoding: FileSystemLegacy.EncodingType.Base64,
@@ -537,7 +531,12 @@ export default function App() {
         mimeType: asset.mimeType,
       });
     } catch (e) {
-      console.warn('[attach] document pick failed:', e?.message ?? e);
+      const msg = e?.message ?? String(e);
+      console.warn('[attach] document pick failed:', msg, e);
+      Alert.alert(
+        'Couldn’t open file picker',
+        msg || 'Try again. If this keeps happening, rebuild the app after updating iOS document settings.'
+      );
     }
   }, []);
 
