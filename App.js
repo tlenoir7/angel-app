@@ -158,6 +158,9 @@ export default function App() {
 
   const listRef = useRef(null);
   const locationRef = useRef(null);
+  /** Prevent overlapping native document / photo pickers (expo throws if re-entered). */
+  const isPickingDocument = useRef(false);
+  const isPickingPhoto = useRef(false);
   const socketRef = useRef(null);
   const expectingResponseRef = useRef(false);
   const playTTSRef = useRef(null);
@@ -178,6 +181,8 @@ export default function App() {
   const [textAttachment, setTextAttachment] = useState(null);
   /** Modal: Choose File vs Choose Photo */
   const [attachMenuVisible, setAttachMenuVisible] = useState(false);
+  /** Disables attach UI while a native picker session is active (refs alone don’t re-render). */
+  const [attachmentPickerBusy, setAttachmentPickerBusy] = useState(false);
   /** Brief status above input while uploading/analyzing attachment */
   const [attachmentStatus, setAttachmentStatus] = useState(null);
 
@@ -502,7 +507,11 @@ export default function App() {
   }, []);
 
   const pickDocumentForText = useCallback(async () => {
+    if (isPickingDocument.current || isPickingPhoto.current) return;
+    isPickingDocument.current = true;
+    setAttachmentPickerBusy(true);
     setAttachMenuVisible(false);
+    await new Promise((resolve) => setTimeout(resolve, 300));
     try {
       // iOS: use */* so UIDocumentPicker can show Files / iCloud / providers; narrow MIME lists often break browsing.
       const result = await DocumentPicker.getDocumentAsync({
@@ -537,15 +546,26 @@ export default function App() {
         'Couldn’t open file picker',
         msg || 'Try again. If this keeps happening, rebuild the app after updating iOS document settings.'
       );
+    } finally {
+      isPickingDocument.current = false;
+      setAttachmentPickerBusy(false);
     }
   }, []);
 
   const pickPhotoFromLibraryForText = useCallback(async () => {
+    if (isPickingDocument.current || isPickingPhoto.current) return;
+    isPickingPhoto.current = true;
+    setAttachmentPickerBusy(true);
     setAttachMenuVisible(false);
+    await new Promise((resolve) => setTimeout(resolve, 300));
     try {
       const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
       if (status !== 'granted') {
         console.warn('[attach] photo library permission denied');
+        Alert.alert(
+          'No photo access',
+          'Allow Angel to access your photo library in Settings to attach images.'
+        );
         return;
       }
       const result = await ImagePicker.launchImageLibraryAsync({
@@ -564,6 +584,7 @@ export default function App() {
       }
       if (!b64) {
         console.warn('[attach] no base64 for library image');
+        Alert.alert('Couldn’t read photo', 'Try choosing a different image.');
         return;
       }
       const baseName = asset.fileName || asset.uri?.split('/').pop()?.split('?')[0] || 'photo.jpg';
@@ -574,7 +595,15 @@ export default function App() {
         previewUri: asset.uri,
       });
     } catch (e) {
-      console.warn('[attach] library photo failed:', e?.message ?? e);
+      const msg = e?.message ?? String(e);
+      console.warn('[attach] library photo failed:', msg, e);
+      Alert.alert(
+        'Couldn’t open photo library',
+        msg || 'Try again in a moment.'
+      );
+    } finally {
+      isPickingPhoto.current = false;
+      setAttachmentPickerBusy(false);
     }
   }, []);
 
@@ -1377,7 +1406,9 @@ export default function App() {
               <TouchableOpacity
                 style={styles.inputRowAttach}
                 onPress={() => setAttachMenuVisible(true)}
-                disabled={loading || visionSending || !!attachmentStatus}
+                disabled={
+                  loading || visionSending || !!attachmentStatus || attachmentPickerBusy
+                }
                 accessibilityLabel="Attach file or photo"
               >
                 <Ionicons name="attach" size={22} color="#E5E7EB" />
@@ -1504,6 +1535,7 @@ export default function App() {
           <TouchableOpacity
             style={styles.attachMenuOption}
             onPress={pickDocumentForText}
+            disabled={attachmentPickerBusy}
           >
             <Ionicons name="document-text-outline" size={22} color="#E5E7EB" />
             <Text style={styles.attachMenuOptionText}>Choose File</Text>
@@ -1511,6 +1543,7 @@ export default function App() {
           <TouchableOpacity
             style={styles.attachMenuOption}
             onPress={pickPhotoFromLibraryForText}
+            disabled={attachmentPickerBusy}
           >
             <Ionicons name="images-outline" size={22} color="#E5E7EB" />
             <Text style={styles.attachMenuOptionText}>Choose Photo</Text>
@@ -1518,6 +1551,7 @@ export default function App() {
           <TouchableOpacity
             style={styles.attachMenuCancel}
             onPress={() => setAttachMenuVisible(false)}
+            disabled={attachmentPickerBusy}
           >
             <Text style={styles.attachMenuCancelText}>Cancel</Text>
           </TouchableOpacity>
