@@ -10,7 +10,9 @@ import {
   Modal,
   Platform,
   Pressable,
+  ScrollView,
   StyleSheet,
+  Switch,
   Text,
   TextInput,
   TouchableOpacity,
@@ -25,6 +27,7 @@ import Constants from 'expo-constants';
 import * as Device from 'expo-device';
 import * as Notifications from 'expo-notifications';
 import { StatusBar } from 'expo-status-bar';
+import ModelViewer3D from './components/ModelViewer3D';
 import {
   useAudioPlayer,
   useAudioPlayerStatus,
@@ -195,6 +198,39 @@ function parseAngelReply(data) {
   );
 }
 
+function extractCadResultFromResponse(data, fallbackReplyText, apiBase) {
+  // Preferred: direct CAD endpoints return { design_name, download_urls, files_generated, ... }
+  if (data && typeof data === 'object') {
+    const dn = (data?.design_name || '').trim();
+    const urls = data?.download_urls;
+    if (dn && urls && typeof urls === 'object') {
+      return { design_name: dn, download_urls: urls, api_base: apiBase };
+    }
+  }
+
+  // Fallback: chat replies may contain one or more /api/cad/download/<design>/<file> links.
+  const txt = String(fallbackReplyText || '');
+  const re = /\/api\/cad\/download\/([^/\s]+)\/([^\s)]+)/g;
+  let m = null;
+  const found = [];
+  // eslint-disable-next-line no-cond-assign
+  while ((m = re.exec(txt))) {
+    found.push({ design: m[1], file: m[2] });
+  }
+  if (!found.length) return null;
+
+  const design = found[0].design;
+  const download_urls = {};
+  for (const f of found) {
+    if (f.design !== design) continue;
+    const ext = (f.file.split('.').pop() || '').toLowerCase();
+    if (ext === 'stl') download_urls.stl = `${apiBase}/api/cad/download/${design}/${f.file}`;
+    if (ext === 'step') download_urls.step = `${apiBase}/api/cad/download/${design}/${f.file}`;
+    if (ext === 'iges') download_urls.iges = `${apiBase}/api/cad/download/${design}/${f.file}`;
+  }
+  return { design_name: design, download_urls, api_base: apiBase };
+}
+
 /** Readable label from expo-location reverseGeocode first result */
 function placeNameFromGeocode(a) {
   if (!a) return '';
@@ -240,6 +276,10 @@ export default function App() {
   const [inputText, setInputText] = useState('');
   const [loading, setLoading] = useState(false);
 
+  // Last CAD generation result (for "View in 3D" button)
+  const [lastCadResult, setLastCadResult] = useState(null); // { design_name, download_urls, api_base }
+  const [viewer3DOpen, setViewer3DOpen] = useState(false);
+
   const [briefingBadge, setBriefingBadge] = useState(false);
 
   const [orbState, setOrbState] = useState('idle'); // 'idle' | 'listening' | 'speaking'
@@ -264,6 +304,9 @@ export default function App() {
   const [visionPreviewUri, setVisionPreviewUri] = useState('');
   const [visionQuestionText, setVisionQuestionText] = useState('');
   const [visionSending, setVisionSending] = useState(false);
+  /** false = Describe (/api/vision), true = Forensic (/api/vision/forensic) */
+  const [visionForensicMode, setVisionForensicMode] = useState(false);
+  const [visionForensicResult, setVisionForensicResult] = useState(null);
 
   /** Text-mode file/photo attachment before send (separate from camera vision flow) */
   const [textAttachment, setTextAttachment] = useState(null);
@@ -591,6 +634,7 @@ export default function App() {
     setVisionImageBase64('');
     setVisionPreviewUri('');
     setVisionQuestionText('');
+    setVisionForensicResult(null);
   }, []);
 
   const openCameraForVision = useCallback(async () => {
@@ -624,6 +668,7 @@ export default function App() {
         console.warn('[vision] no base64 available for captured image');
         return;
       }
+      setVisionForensicResult(null);
       setVisionImageBase64(b64);
       setVisionPreviewUri(asset.uri ?? '');
       setVisionQuestionText('');
@@ -821,9 +866,44 @@ export default function App() {
   const submitVision = useCallback(
     async (question) => {
       const q = (question || '').trim();
-      if (!q || !visionImageBase64 || visionSending) return;
+      if (!visionImageBase64 || visionSending) return;
+      if (!visionForensicMode && !q) return;
+
       setVisionSending(true);
+      setVisionForensicResult(null);
       try {
+        if (visionForensicMode) {
+          const ctx = q || 'Forensic visual analysis.';
+          const visionLoc = locationFieldFromRef(locationRef);
+          const tylerLocationStr =
+            (visionLoc?.place && String(visionLoc.place).trim()) ||
+            (visionLoc &&
+            typeof visionLoc.latitude === 'number' &&
+            typeof visionLoc.longitude === 'number'
+              ? `${visionLoc.latitude},${visionLoc.longitude}`
+              : '');
+
+          const res = await fetch(`${API_BASE}/api/vision/forensic`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              image_base64: visionImageBase64,
+              context: ctx,
+              ...(tylerLocationStr ? { tyler_location: tylerLocationStr } : {}),
+              file_name: 'ios-camera.jpg',
+            }),
+          });
+          const data = await res.json().catch(() => ({}));
+          console.log('[vision] /api/vision/forensic response:', { status: res.status, data });
+          if (!res.ok || data.ok === false) {
+            const err = data.error || `HTTP ${res.status}`;
+            Alert.alert('Forensic vision', String(err));
+            return;
+          }
+          setVisionForensicResult(data);
+          return;
+        }
+
         const visionBody = {
           image: visionImageBase64,
           question: q,
@@ -872,8 +952,37 @@ export default function App() {
         setVisionSending(false);
       }
     },
-    [visionImageBase64, visionSending, playTTS, closeVisionModal]
+    [visionImageBase64, visionSending, visionForensicMode, playTTS, closeVisionModal]
   );
+
+  const fileVisionForensicToIntel = useCallback(async () => {
+    if (!visionImageBase64 || !visionForensicResult) return;
+    setVisionSending(true);
+    try {
+      const payload = { ...visionForensicResult };
+      delete payload.mission_cross_reference;
+      delete payload.network_updates_applied;
+      const r = await fetch(`${API_BASE}/api/vision/forensic/file`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          image_base64: visionImageBase64,
+          forensic_json: payload,
+          file_name: 'ios-camera.jpg',
+        }),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!j.ok) throw new Error(j.error || 'File failed');
+      Alert.alert('Filed', j.cabinet_file || 'Visual Intelligence');
+      setVisionForensicResult((prev) =>
+        prev ? { ...prev, show_manual_file_button: false, auto_filed: true } : prev
+      );
+    } catch (e) {
+      Alert.alert('File error', String(e.message || e));
+    } finally {
+      setVisionSending(false);
+    }
+  }, [visionImageBase64, visionForensicResult]);
 
   // Socket.IO — real-time text/voice; HTTP used when disconnected
   useEffect(() => {
@@ -970,6 +1079,10 @@ export default function App() {
           ...prev,
           { id: makeId(), role: 'assistant', content: reply },
         ]);
+        const cad = extractCadResultFromResponse(data, reply, API_BASE);
+        if (cad?.design_name) {
+          setLastCadResult(cad);
+        }
         if (shouldPlayTTS) {
           playTTSRef.current?.(reply);
         } else {
@@ -1324,6 +1437,10 @@ export default function App() {
         content: reply || 'Sorry, I couldn’t process that.',
       };
       setMessages((prev) => [...prev, assistantMsg]);
+      const cad = extractCadResultFromResponse(data, reply, API_BASE);
+      if (cad?.design_name) {
+        setLastCadResult(cad);
+      }
       /* Text mode: show reply only, no TTS */
     } catch (e) {
       setMessages((prev) => [
@@ -1814,6 +1931,18 @@ export default function App() {
               }
             />
 
+            {lastCadResult?.design_name ? (
+              <TouchableOpacity
+                style={styles.view3DBtn}
+                onPress={() => setViewer3DOpen(true)}
+                accessibilityLabel={`View ${lastCadResult.design_name} in 3D`}
+              >
+                <Text style={styles.view3DBtnText}>
+                  🔺 View {lastCadResult.design_name} in 3D
+                </Text>
+              </TouchableOpacity>
+            ) : null}
+
             {(attachmentStatus || textAttachment) ? (
               <View style={styles.attachmentPreviewWrap}>
                 {attachmentStatus ? (
@@ -1904,6 +2033,14 @@ export default function App() {
       </Animated.View>
       </KeyboardAvoidingView>
 
+      {viewer3DOpen && lastCadResult?.design_name ? (
+        <ModelViewer3D
+          designName={lastCadResult.design_name}
+          apiBase={API_BASE}
+          onClose={() => setViewer3DOpen(false)}
+        />
+      ) : null}
+
       <Modal
         visible={visionModalVisible}
         animationType="slide"
@@ -1923,59 +2060,173 @@ export default function App() {
             }}
           />
           <View style={styles.visionModalCard}>
-            <Text style={styles.visionModalTitle}>What do you want to know?</Text>
-            {visionPreviewUri ? (
-              <Image
-                source={{ uri: visionPreviewUri }}
-                style={styles.visionPreview}
-                resizeMode="cover"
-              />
-            ) : null}
-            <TextInput
-              style={styles.visionQuestionInput}
-              placeholder="What do you want to know?"
-              placeholderTextColor="#6B7280"
-              value={visionQuestionText}
-              onChangeText={setVisionQuestionText}
-              editable={!visionSending}
-              multiline
-              maxLength={2000}
-            />
-            <TouchableOpacity
-              style={styles.visionAnalyzeBtn}
-              onPress={() => submitVision(VISION_ANALYZE_QUESTION)}
-              disabled={visionSending || !visionImageBase64}
-            >
-              <Text style={styles.visionAnalyzeBtnText}>Analyze</Text>
-              <Text style={styles.visionAnalyzeHint} numberOfLines={2}>
-                {VISION_ANALYZE_QUESTION}
-              </Text>
-            </TouchableOpacity>
-            <View style={styles.visionModalActions}>
-              <TouchableOpacity
-                style={styles.visionCancelBtn}
-                onPress={() => {
-                  if (!visionSending) closeVisionModal();
-                }}
-                disabled={visionSending}
+            {visionForensicResult ? (
+              <ScrollView
+                style={styles.visionForensicScroll}
+                keyboardShouldPersistTaps="handled"
+                showsVerticalScrollIndicator={false}
               >
-                <Text style={styles.visionCancelBtnText}>Cancel</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={[
-                  styles.visionSendBtn,
-                  (!visionQuestionText.trim() || visionSending) && styles.visionSendBtnDisabled,
-                ]}
-                onPress={() => submitVision(visionQuestionText)}
-                disabled={!visionQuestionText.trim() || visionSending || !visionImageBase64}
-              >
-                {visionSending ? (
-                  <ActivityIndicator size="small" color="#000" />
+                <Text style={styles.visionModalTitle}>Forensic report</Text>
+                <Text style={styles.visionForensicBadge}>
+                  TYPE:{' '}
+                  {String(
+                    visionForensicResult.classification?.primary_type ||
+                      visionForensicResult.analysis_type ||
+                      '—'
+                  ).toUpperCase()}
+                </Text>
+                <Text style={styles.visionForensicBadge}>
+                  CONFIDENCE: {visionForensicResult.confidence || '—'}
+                </Text>
+                <Text style={styles.visionForensicBadge}>
+                  MISSION: {visionForensicResult.mission_relevance || '—'}
+                </Text>
+                <Text style={styles.visionForensicSummary}>
+                  {visionForensicResult.summary_for_progressive_ui ||
+                    visionForensicResult.summary ||
+                    ''}
+                </Text>
+                <Text style={styles.visionForensicSection}>Key findings</Text>
+                {(visionForensicResult.key_findings || []).map((k, i) => (
+                  <Text key={`kf-${i}`} style={styles.visionForensicBullet}>
+                    • {k}
+                  </Text>
+                ))}
+                <Text style={styles.visionForensicSection}>Anomalies</Text>
+                {(visionForensicResult.anomalies || []).length ? (
+                  (visionForensicResult.anomalies || []).map((a, i) => (
+                    <Text key={`an-${i}`} style={styles.visionForensicAnomaly}>
+                      ⚠ {a}
+                    </Text>
+                  ))
                 ) : (
-                  <Text style={styles.visionSendBtnText}>Send</Text>
+                  <Text style={styles.visionForensicMuted}>None noted</Text>
                 )}
-              </TouchableOpacity>
-            </View>
+                <Text style={styles.visionForensicAction}>
+                  {visionForensicResult.recommended_action || ''}
+                </Text>
+                {visionForensicResult.show_manual_file_button ? (
+                  <TouchableOpacity
+                    style={styles.visionFileIntelBtn}
+                    onPress={fileVisionForensicToIntel}
+                    disabled={visionSending}
+                  >
+                    <Text style={styles.visionFileIntelBtnText}>File to Intelligence</Text>
+                  </TouchableOpacity>
+                ) : null}
+                {visionForensicResult.auto_filed ? (
+                  <Text style={styles.visionForensicMuted}>
+                    Auto-filed to Visual Intelligence
+                  </Text>
+                ) : null}
+                <View style={styles.visionForensicFooter}>
+                  <TouchableOpacity
+                    style={styles.visionCancelBtn}
+                    onPress={() => {
+                      if (!visionSending) setVisionForensicResult(null);
+                    }}
+                    disabled={visionSending}
+                  >
+                    <Text style={styles.visionCancelBtnText}>Back</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={styles.visionSendBtn}
+                    onPress={() => {
+                      if (!visionSending) closeVisionModal();
+                    }}
+                    disabled={visionSending}
+                  >
+                    <Text style={styles.visionSendBtnText}>Done</Text>
+                  </TouchableOpacity>
+                </View>
+              </ScrollView>
+            ) : (
+              <>
+                <Text style={styles.visionModalTitle}>What do you want to know?</Text>
+                <View style={styles.visionModeRow}>
+                  <Text style={styles.visionModeLabel}>Describe</Text>
+                  <Switch
+                    value={visionForensicMode}
+                    onValueChange={setVisionForensicMode}
+                    disabled={visionSending}
+                    trackColor={{ false: '#374151', true: '#6D28FF' }}
+                    thumbColor={Platform.OS === 'ios' ? '#fff' : '#E9D5FF'}
+                  />
+                  <Text style={styles.visionModeLabel}>Forensic</Text>
+                </View>
+                {visionPreviewUri ? (
+                  <Image
+                    source={{ uri: visionPreviewUri }}
+                    style={styles.visionPreview}
+                    resizeMode="cover"
+                  />
+                ) : null}
+                <TextInput
+                  style={styles.visionQuestionInput}
+                  placeholder={
+                    visionForensicMode
+                      ? 'Context for forensic analysis (optional)'
+                      : 'What do you want to know?'
+                  }
+                  placeholderTextColor="#6B7280"
+                  value={visionQuestionText}
+                  onChangeText={setVisionQuestionText}
+                  editable={!visionSending}
+                  multiline
+                  maxLength={2000}
+                />
+                <TouchableOpacity
+                  style={styles.visionAnalyzeBtn}
+                  onPress={() =>
+                    submitVision(
+                      visionForensicMode
+                        ? 'Forensic visual analysis.'
+                        : VISION_ANALYZE_QUESTION
+                    )
+                  }
+                  disabled={visionSending || !visionImageBase64}
+                >
+                  <Text style={styles.visionAnalyzeBtnText}>Analyze</Text>
+                  <Text style={styles.visionAnalyzeHint} numberOfLines={2}>
+                    {visionForensicMode
+                      ? 'Run full structured forensic pass'
+                      : VISION_ANALYZE_QUESTION}
+                  </Text>
+                </TouchableOpacity>
+                <View style={styles.visionModalActions}>
+                  <TouchableOpacity
+                    style={styles.visionCancelBtn}
+                    onPress={() => {
+                      if (!visionSending) closeVisionModal();
+                    }}
+                    disabled={visionSending}
+                  >
+                    <Text style={styles.visionCancelBtnText}>Cancel</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={[
+                      styles.visionSendBtn,
+                      (visionSending ||
+                        !visionImageBase64 ||
+                        (!visionForensicMode && !visionQuestionText.trim())) &&
+                        styles.visionSendBtnDisabled,
+                    ]}
+                    onPress={() => submitVision(visionQuestionText)}
+                    disabled={
+                      visionSending ||
+                      !visionImageBase64 ||
+                      (!visionForensicMode && !visionQuestionText.trim())
+                    }
+                  >
+                    {visionSending ? (
+                      <ActivityIndicator size="small" color="#000" />
+                    ) : (
+                      <Text style={styles.visionSendBtnText}>Send</Text>
+                    )}
+                  </TouchableOpacity>
+                </View>
+              </>
+            )}
           </View>
         </KeyboardAvoidingView>
       </Modal>
@@ -2180,6 +2431,18 @@ const styles = StyleSheet.create({
   textWrap: { flex: 1 },
   listContent: { paddingHorizontal: 16, paddingVertical: 16, paddingBottom: 18 },
   emptyText: { color: '#6B7280', textAlign: 'center', marginTop: 36, fontSize: 15 },
+  view3DBtn: {
+    marginHorizontal: 16,
+    marginTop: 2,
+    marginBottom: 10,
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+    borderRadius: 14,
+    backgroundColor: '#0B0F1A',
+    borderWidth: 1,
+    borderColor: '#312E81',
+  },
+  view3DBtnText: { color: '#C4B5FD', fontSize: 14, fontWeight: '800', textAlign: 'center' },
   bubble: {
     maxWidth: '88%',
     paddingHorizontal: 14,
@@ -2418,4 +2681,76 @@ const styles = StyleSheet.create({
   },
   visionSendBtnDisabled: { opacity: 0.5 },
   visionSendBtnText: { color: '#000', fontSize: 16, fontWeight: '700' },
+
+  visionModeRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 12,
+    marginBottom: 14,
+  },
+  visionModeLabel: { color: '#9CA3AF', fontSize: 14, fontWeight: '600' },
+  visionForensicScroll: { maxHeight: 480 },
+  visionForensicBadge: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#A78BFA',
+    marginBottom: 4,
+    letterSpacing: 0.3,
+  },
+  visionForensicSummary: {
+    color: '#E5E7EB',
+    fontSize: 16,
+    lineHeight: 24,
+    marginTop: 10,
+    marginBottom: 8,
+  },
+  visionForensicSection: {
+    color: '#fff',
+    fontWeight: '700',
+    fontSize: 15,
+    marginTop: 12,
+    marginBottom: 6,
+  },
+  visionForensicBullet: {
+    color: '#E5E7EB',
+    fontSize: 14,
+    lineHeight: 20,
+    marginLeft: 4,
+    marginBottom: 4,
+  },
+  visionForensicAnomaly: {
+    color: '#FBBF24',
+    fontSize: 14,
+    lineHeight: 20,
+    marginBottom: 4,
+  },
+  visionForensicMuted: { color: '#6B7280', fontSize: 13, marginTop: 8 },
+  visionForensicAction: {
+    color: '#9CA3AF',
+    fontSize: 14,
+    fontStyle: 'italic',
+    marginTop: 12,
+    marginBottom: 8,
+    lineHeight: 20,
+  },
+  visionFileIntelBtn: {
+    marginTop: 8,
+    marginBottom: 8,
+    paddingVertical: 14,
+    borderRadius: 14,
+    backgroundColor: '#1E1B4B',
+    borderWidth: 1,
+    borderColor: '#6D28FF',
+    alignItems: 'center',
+  },
+  visionFileIntelBtnText: { color: '#E9D5FF', fontSize: 16, fontWeight: '700' },
+  visionForensicFooter: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 12,
+    marginTop: 16,
+    paddingBottom: 4,
+  },
 });

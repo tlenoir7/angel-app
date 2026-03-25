@@ -17,13 +17,16 @@
     "expo-device": "~55.0.9",
     "expo-document-picker": "~55.0.9",
     "expo-file-system": "~55.0.11",
+    "expo-gl": "~55.0.10",
     "expo-image-picker": "~55.0.13",
     "expo-location": "~55.1.4",
     "expo-notifications": "~55.0.12",
     "expo-status-bar": "~55.0.4",
+    "expo-three": "^8.0.0",
     "react": "19.2.0",
     "react-native": "0.83.2",
-    "socket.io-client": "4.6.2"
+    "socket.io-client": "4.6.2",
+    "three": "^0.166.1"
   },
   "react-native": {
     "resolver": {
