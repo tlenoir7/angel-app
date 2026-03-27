@@ -713,8 +713,25 @@ export default function App() {
         return;
       }
       const asset = result.assets[0];
+      console.log('[attach] document selected (raw asset):', asset);
+      console.log('[attach] document selected (metadata):', {
+        fileName: asset?.name || 'file',
+        mimeType: asset?.mimeType || '(unknown)',
+        sizeBytes:
+          typeof asset?.size === 'number'
+            ? asset.size
+            : typeof asset?.fileSize === 'number'
+              ? asset.fileSize
+              : '(unknown)',
+        uri: asset?.uri || '(none)',
+      });
       const b64 = await FileSystemLegacy.readAsStringAsync(asset.uri, {
         encoding: FileSystemLegacy.EncodingType.Base64,
+      });
+      console.log('[attach] document base64 prepared:', {
+        fileName: asset?.name || 'file',
+        mimeType: asset?.mimeType || '(unknown)',
+        base64Length: typeof b64 === 'string' ? b64.length : 0,
       });
       setTextAttachment({
         kind: 'document',
@@ -1306,6 +1323,15 @@ export default function App() {
       );
       try {
         if (attachSnap.kind === 'document') {
+          const filesReadUrl = `${API_BASE}/api/files/read`;
+          console.log('[attach] document upload start', {
+            apiBase: API_BASE,
+            endpoint: filesReadUrl,
+            isLocalhost: /localhost|127\.0\.0\.1/i.test(API_BASE),
+            fileName: attachSnap.fileName,
+            mimeType: attachSnap.mimeType || '(unknown)',
+            base64Length: typeof attachSnap.base64 === 'string' ? attachSnap.base64.length : 0,
+          });
           const body = {
             file_content: attachSnap.base64,
             file_name: attachSnap.fileName,
@@ -1316,7 +1342,7 @@ export default function App() {
           const fc = body.file_content;
           const fcStr = typeof fc === 'string' ? fc : '';
           console.log('[attach] /api/files/read REQUEST (pre-fetch)', {
-            url: `${API_BASE}/api/files/read`,
+            url: filesReadUrl,
             headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
             file_name: body.file_name,
             context: body.context,
@@ -1326,7 +1352,8 @@ export default function App() {
             file_content_length: fcStr.length,
             file_content_prefix: fcStr.slice(0, 120),
           });
-          const res = await fetch(`${API_BASE}/api/files/read`, {
+          console.log('[attach] /api/files/read sending request now');
+          const res = await fetch(filesReadUrl, {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
@@ -1348,6 +1375,12 @@ export default function App() {
             console.warn('[attach] /api/files/read JSON parse failed:', parseErr?.message ?? parseErr);
           }
           console.log('[attach] /api/files/read parsed:', data);
+          console.log('[attach] /api/files/read success path complete', {
+            status: res.status,
+            ok: res.ok,
+            hasReply: !!parseAngelReply(data),
+            backendError: data?.error ?? null,
+          });
           const reply = parseAngelReply(data) || (typeof data === 'string' ? data : '');
           const errMsg = data?.error != null ? String(data.error) : '';
           const assistantText =
@@ -1389,6 +1422,15 @@ export default function App() {
         }
         setTextAttachment(null);
       } catch (e) {
+        console.error('[attach] upload failed (full error):', {
+          message: e?.message ?? String(e),
+          name: e?.name,
+          stack: e?.stack,
+          full: e,
+          apiBase: API_BASE,
+          endpoint:
+            attachSnap?.kind === 'document' ? `${API_BASE}/api/files/read` : `${API_BASE}/api/vision`,
+        });
         console.warn('[attach] upload failed:', e?.message ?? e);
         setMessages((prev) => [
           ...prev,
