@@ -296,6 +296,9 @@ export default function App() {
   const modeRef = useRef(mode);
   /** True if the in-flight socket reply is for a `user_audio` emit (not `user_text`) */
   const lastSocketRequestWasVoiceRef = useRef(false);
+  /** Streaming assistant bubble state for `angel_chunk` events. */
+  const streamingAssistantIdRef = useRef(null);
+  const streamingAssistantTextRef = useRef('');
 
   const [socketConnected, setSocketConnected] = useState(false);
 
@@ -1053,6 +1056,8 @@ export default function App() {
         setLoading(false);
         setOrbState('idle');
       }
+      streamingAssistantIdRef.current = null;
+      streamingAssistantTextRef.current = '';
       console.log('[socket] disconnected', { reason, url: API_BASE, path: SOCKET_IO_PATH });
     };
     const onConnectError = (err) => {
@@ -1086,6 +1091,10 @@ export default function App() {
     };
 
     const onAngelResponse = (data) => {
+      // Backward-compat path: some servers still send final `angel_response`.
+      if (streamingAssistantIdRef.current) {
+        return;
+      }
       expectingResponseRef.current = false;
       setLoading(false);
       const reply = parseAngelReply(data);
@@ -1123,6 +1132,55 @@ export default function App() {
         ]);
         setOrbState('idle');
       }
+    };
+
+    const onAngelChunk = (payload) => {
+      const chunk = typeof payload === 'string' ? payload : payload?.chunk ?? '';
+      if (!chunk) return;
+      if (expectingResponseRef.current) {
+        setLoading(true);
+      }
+      if (!streamingAssistantIdRef.current) {
+        const id = makeId();
+        streamingAssistantIdRef.current = id;
+        streamingAssistantTextRef.current = String(chunk);
+        setMessages((prev) => [...prev, { id, role: 'assistant', content: String(chunk) }]);
+        return;
+      }
+      streamingAssistantTextRef.current += String(chunk);
+      const curId = streamingAssistantIdRef.current;
+      const textNow = streamingAssistantTextRef.current;
+      setMessages((prev) =>
+        prev.map((m) => (m.id === curId ? { ...m, content: textNow } : m))
+      );
+    };
+
+    const onAngelReplyComplete = (payload) => {
+      expectingResponseRef.current = false;
+      setLoading(false);
+      const reply = parseAngelReply(payload) || streamingAssistantTextRef.current || '';
+      if (streamingAssistantIdRef.current) {
+        const curId = streamingAssistantIdRef.current;
+        setMessages((prev) =>
+          prev.map((m) => (m.id === curId ? { ...m, content: reply } : m))
+        );
+      } else if (reply) {
+        setMessages((prev) => [...prev, { id: makeId(), role: 'assistant', content: reply }]);
+      }
+      const cad = extractCadResultFromResponse(payload, reply, API_BASE);
+      if (cad?.design_name) {
+        setLastCadResult(cad);
+      }
+      const fromVoice = lastSocketRequestWasVoiceRef.current;
+      const inVoiceMode = modeRef.current === 'voice';
+      const shouldPlayTTS = inVoiceMode || fromVoice;
+      if (reply && shouldPlayTTS) {
+        playTTSRef.current?.(reply);
+      } else {
+        setOrbState('idle');
+      }
+      streamingAssistantIdRef.current = null;
+      streamingAssistantTextRef.current = '';
     };
 
     const mergeRealtimePlayback = async () => {
@@ -1215,6 +1273,8 @@ export default function App() {
     socket.on('connect_error', onConnectError);
     socket.on('angel_thinking', onAngelThinking);
     socket.on('angel_transcript', onAngelTranscript);
+    socket.on('angel_chunk', onAngelChunk);
+    socket.on('angel_reply_complete', onAngelReplyComplete);
     socket.on('angel_response', onAngelResponse);
     socket.on('realtime_ready', onRealtimeReady);
     socket.on('realtime_audio_response', onRealtimeAudioResponse);
@@ -1262,6 +1322,8 @@ export default function App() {
       socket.off('connect_error', onConnectError);
       socket.off('angel_thinking', onAngelThinking);
       socket.off('angel_transcript', onAngelTranscript);
+      socket.off('angel_chunk', onAngelChunk);
+      socket.off('angel_reply_complete', onAngelReplyComplete);
       socket.off('angel_response', onAngelResponse);
       socket.off('realtime_ready', onRealtimeReady);
       socket.off('realtime_audio_response', onRealtimeAudioResponse);
@@ -1455,6 +1517,8 @@ export default function App() {
     if (socket?.connected) {
       lastSocketRequestWasVoiceRef.current = false;
       expectingResponseRef.current = true;
+      streamingAssistantIdRef.current = null;
+      streamingAssistantTextRef.current = '';
       setLoading(true);
       const textPayload = { message: trimmed };
       if (locField) textPayload.location = locField;
