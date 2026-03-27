@@ -321,8 +321,8 @@ export default function App() {
   const [voiceInputMode, setVoiceInputMode] = useState('standard');
   const [realtimeReady, setRealtimeReady] = useState(false);
   const [realtimeOrbLabel, setRealtimeOrbLabel] = useState('');
-  /** True while Realtime hold-to-speak is active (second `AudioRecorder`); separate from Standard `isRecording`. */
-  const [rtHolding, setRtHolding] = useState(false);
+  /** True while Realtime mic is streaming to the server (second `AudioRecorder`); separate from Standard `isRecording`. */
+  const [realtimeStreaming, setRealtimeStreaming] = useState(false);
 
   const realtimeChunkIntervalRef = useRef(null);
   const realtimePcmSentRef = useRef(0);
@@ -334,10 +334,16 @@ export default function App() {
   /** Set after `cleanupRealtimeRecording` is defined each render (socket handlers call latest cleanup). */
   const cleanupRealtimeRecordingRef = useRef(() => {});
   const voiceInputModeRef = useRef('standard');
+  const realtimeReadyRef = useRef(false);
+  const beginRealtimeStreamingRef = useRef(() => Promise.resolve());
 
   useEffect(() => {
     voiceInputModeRef.current = voiceInputMode;
   }, [voiceInputMode]);
+
+  useEffect(() => {
+    realtimeReadyRef.current = realtimeReady;
+  }, [realtimeReady]);
 
   useEffect(() => {
     modeRef.current = mode;
@@ -439,6 +445,7 @@ export default function App() {
       setOrbState('idle');
       if (voiceInputModeRef.current === 'realtime') {
         setRealtimeOrbLabel('Listening…');
+        beginRealtimeStreamingRef.current?.();
       }
     }
   }, [realtimeResponseStatus?.playing]);
@@ -1102,9 +1109,17 @@ export default function App() {
     };
 
     const mergeRealtimePlayback = async () => {
+      try {
+        cleanupRealtimeRecordingRef.current?.();
+      } catch (_) {}
       const chunks = realtimeResponsePcmRef.current;
       realtimeResponsePcmRef.current = [];
-      if (!chunks.length) return;
+      if (!chunks.length) {
+        if (voiceInputModeRef.current === 'realtime') {
+          beginRealtimeStreamingRef.current?.();
+        }
+        return;
+      }
       const parts = chunks.map((c) => base64ToUint8Array(c));
       let total = 0;
       for (const p of parts) total += p.length;
@@ -1462,10 +1477,100 @@ export default function App() {
     if (rec?.isRecording) {
       rec.stop().catch(() => {});
     }
-    setRtHolding(false);
+    setRealtimeStreaming(false);
   }, []);
 
   cleanupRealtimeRecordingRef.current = cleanupRealtimeRecording;
+
+  const beginRealtimeStreaming = useCallback(async () => {
+    if (voiceInputModeRef.current !== 'realtime' || modeRef.current !== 'voice') return;
+    if (!realtimeReadyRef.current || !socketRef.current?.connected) return;
+
+    try {
+      setOrbState('listening');
+      setRealtimeOrbLabel('Listening…');
+
+      const perm = await AudioModule.requestRecordingPermissionsAsync();
+      if (!perm?.granted) {
+        setOrbState('idle');
+        setRealtimeStreaming(false);
+        Alert.alert('Microphone', 'Permission is required for Realtime voice.');
+        return;
+      }
+
+      await setAudioModeAsync({
+        allowsRecording: true,
+        playsInSilentMode: true,
+        interruptionMode: 'duckOthers',
+        shouldPlayInBackground: false,
+        shouldRouteThroughEarpiece: false,
+      });
+
+      if (voiceInputModeRef.current !== 'realtime' || modeRef.current !== 'voice') return;
+      if (!realtimeReadyRef.current || !socketRef.current?.connected) return;
+
+      cleanupRealtimeRecordingRef.current?.();
+
+      if (voiceInputModeRef.current !== 'realtime' || modeRef.current !== 'voice') return;
+
+      await realtimeAudioRecorder.prepareToRecordAsync();
+      if (voiceInputModeRef.current !== 'realtime' || modeRef.current !== 'voice') return;
+      if (!realtimeReadyRef.current || !socketRef.current?.connected) return;
+
+      realtimeAudioRecorder.record();
+      realtimePcmSentRef.current = 0;
+      setRealtimeStreaming(true);
+
+      realtimeChunkIntervalRef.current = setInterval(async () => {
+        const uri = realtimeAudioRecorderRef.current?.uri;
+        if (!uri) return;
+        try {
+          const b64 = await FileSystemLegacy.readAsStringAsync(uri, {
+            encoding: FileSystemLegacy.EncodingType.Base64,
+          });
+          const fullBytes = base64ToUint8Array(b64);
+          const { chunk, nextOffset } = extractNewPcmFromWavFile(
+            fullBytes,
+            realtimePcmSentRef.current
+          );
+          realtimePcmSentRef.current = nextOffset;
+          if (chunk.length > 0) {
+            const pcmB64 = uint8ArrayToBase64(chunk);
+            socketRef.current?.emit('realtime_audio_chunk', { audio_b64: pcmB64 });
+          }
+        } catch (e) {
+          console.warn('[realtime] chunk:', e?.message ?? e);
+        }
+      }, 500);
+    } catch (e) {
+      console.warn('[realtime] begin streaming failed:', e?.message ?? e);
+      setOrbState('idle');
+      setRealtimeStreaming(false);
+    }
+  }, [realtimeAudioRecorder]);
+
+  beginRealtimeStreamingRef.current = beginRealtimeStreaming;
+
+  useEffect(() => {
+    const canStream =
+      mode === 'voice' &&
+      voiceInputMode === 'realtime' &&
+      realtimeReady &&
+      socketConnected;
+
+    if (!canStream) {
+      cleanupRealtimeRecording();
+      return;
+    }
+
+    (async () => {
+      await beginRealtimeStreamingRef.current?.();
+    })();
+
+    return () => {
+      cleanupRealtimeRecording();
+    };
+  }, [mode, voiceInputMode, realtimeReady, socketConnected, cleanupRealtimeRecording]);
 
   useEffect(() => {
     if (mode !== 'text') return;
@@ -1503,64 +1608,6 @@ export default function App() {
     try {
       if (loading) return;
 
-      if (voiceInputMode === 'realtime') {
-        if (!socketRef.current?.connected) {
-          Alert.alert('Realtime', 'Connect to the server first (green dot).');
-          return;
-        }
-        if (!realtimeReady) {
-          setRealtimeOrbLabel('Connecting…');
-          return;
-        }
-
-        setOrbState('listening');
-        setRealtimeOrbLabel('Listening…');
-
-        const perm = await AudioModule.requestRecordingPermissionsAsync();
-        if (!perm?.granted) {
-          setOrbState('idle');
-          Alert.alert('Microphone', 'Permission is required for Realtime voice.');
-          return;
-        }
-
-        await setAudioModeAsync({
-          allowsRecording: true,
-          playsInSilentMode: true,
-          interruptionMode: 'duckOthers',
-          shouldPlayInBackground: false,
-          shouldRouteThroughEarpiece: false,
-        });
-
-        cleanupRealtimeRecording();
-        await realtimeAudioRecorder.prepareToRecordAsync();
-        realtimeAudioRecorder.record();
-        realtimePcmSentRef.current = 0;
-        setRtHolding(true);
-
-        realtimeChunkIntervalRef.current = setInterval(async () => {
-          const uri = realtimeAudioRecorderRef.current?.uri;
-          if (!uri) return;
-          try {
-            const b64 = await FileSystemLegacy.readAsStringAsync(uri, {
-              encoding: FileSystemLegacy.EncodingType.Base64,
-            });
-            const fullBytes = base64ToUint8Array(b64);
-            const { chunk, nextOffset } = extractNewPcmFromWavFile(
-              fullBytes,
-              realtimePcmSentRef.current
-            );
-            realtimePcmSentRef.current = nextOffset;
-            if (chunk.length > 0) {
-              const pcmB64 = uint8ArrayToBase64(chunk);
-              socketRef.current?.emit('realtime_audio_chunk', { audio_b64: pcmB64 });
-            }
-          } catch (e) {
-            console.warn('[realtime] chunk:', e?.message ?? e);
-          }
-        }, 500);
-        return;
-      }
-
       setOrbState('listening');
 
       const perm = await AudioModule.requestRecordingPermissionsAsync();
@@ -1580,25 +1627,9 @@ export default function App() {
     } catch (_) {
       setOrbState('idle');
     }
-  }, [
-    loading,
-    audioRecorder,
-    voiceInputMode,
-    realtimeReady,
-    cleanupRealtimeRecording,
-    realtimeAudioRecorder,
-  ]);
+  }, [loading, audioRecorder]);
 
   const stopRecording = useCallback(async () => {
-    if (voiceInputMode === 'realtime') {
-      cleanupRealtimeRecording();
-      setOrbState('idle');
-      if (realtimeReady) {
-        setRealtimeOrbLabel('Listening…');
-      }
-      return;
-    }
-
     if (!recorderState?.isRecording) {
       setOrbState('idle');
       return;
@@ -1688,14 +1719,7 @@ export default function App() {
         setLoading(false);
       }
     }
-  }, [
-    voiceInputMode,
-    cleanupRealtimeRecording,
-    realtimeReady,
-    recorderState?.isRecording,
-    audioRecorder,
-    playTTS,
-  ]);
+  }, [recorderState?.isRecording, audioRecorder, playTTS]);
 
   const orbScale = useMemo(() => {
     const idleS = idlePulse.interpolate({ inputRange: [0, 1], outputRange: [1, 1.05] });
@@ -1729,11 +1753,14 @@ export default function App() {
       if (!realtimeReady) return realtimeOrbLabel || 'Connecting…';
     }
     if (loading) return socketConnected ? 'Angel is thinking…' : 'Connecting…';
-    if (voiceInputMode === 'realtime' && realtimeOrbLabel) return realtimeOrbLabel;
-    if (orbState === 'speaking') {
-      return voiceInputMode === 'realtime' ? 'Speaking…' : 'Angel is speaking…';
+    if (voiceInputMode === 'realtime') {
+      if (orbState === 'speaking') return 'Speaking…';
+      if (realtimeOrbLabel && realtimeOrbLabel !== 'Listening…') return realtimeOrbLabel;
+      if (realtimeStreaming) return 'Listening…';
+      return 'Preparing mic…';
     }
-    if (isRecording || rtHolding) return 'Listening…';
+    if (orbState === 'speaking') return 'Angel is speaking…';
+    if (isRecording) return 'Listening…';
     return 'Hold to speak';
   }, [
     voiceInputMode,
@@ -1743,7 +1770,7 @@ export default function App() {
     loading,
     orbState,
     isRecording,
-    rtHolding,
+    realtimeStreaming,
   ]);
 
   const renderMessage = useCallback(({ item }) => {
@@ -1889,18 +1916,22 @@ export default function App() {
 
             <Text style={styles.voiceHint}>{voiceHintText}</Text>
 
-            <Pressable
-              style={[
-                styles.holdToSpeak,
-                (isRecording || rtHolding) && styles.holdToSpeakActive,
-              ]}
-              onPressIn={startRecording}
-              onPressOut={stopRecording}
-            >
-              <Text style={styles.holdToSpeakText}>
-                {isRecording || rtHolding ? 'Release' : 'Hold'}
-              </Text>
-            </Pressable>
+            {voiceInputMode === 'standard' ? (
+              <Pressable
+                style={[
+                  styles.holdToSpeak,
+                  isRecording && styles.holdToSpeakActive,
+                ]}
+                onPressIn={startRecording}
+                onPressOut={stopRecording}
+              >
+                <Text style={styles.holdToSpeakText}>
+                  {isRecording ? 'Release' : 'Hold'}
+                </Text>
+              </Pressable>
+            ) : (
+              <View style={styles.realtimeMicSpacer} />
+            )}
             </View>
             <View style={styles.voiceBottomBar}>
               <TouchableOpacity
@@ -2411,6 +2442,7 @@ const styles = StyleSheet.create({
     borderColor: 'rgba(255,255,255,0.35)',
   },
   voiceHint: { color: '#9CA3AF', fontSize: 14, marginBottom: 18 },
+  realtimeMicSpacer: { height: 46, marginBottom: 0 },
   holdToSpeak: {
     width: 180,
     height: 46,
