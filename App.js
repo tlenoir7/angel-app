@@ -379,6 +379,11 @@ export default function App() {
   const realtimeAudioRecorderRef = useRef(null);
   /** Set after `cleanupRealtimeRecording` is defined each render (socket handlers call latest cleanup). */
   const cleanupRealtimeRecordingRef = useRef(() => {});
+  /** After Realtime TTS `play()`, until we reset session and restart the mic. */
+  const realtimeAwaitingPlaybackFinalizeRef = useRef(false);
+  const realtimePlaybackFallbackTimerRef = useRef(null);
+  /** Set after `finalizeRealtimeResponsePlayback` is defined (effect + socket merge call this). */
+  const finalizeRealtimeResponsePlaybackRef = useRef(() => Promise.resolve());
   const voiceInputModeRef = useRef('standard');
   const realtimeReadyRef = useRef(false);
   const beginRealtimeStreamingRef = useRef(() => Promise.resolve());
@@ -484,17 +489,35 @@ export default function App() {
 
   const wasPlayingRealtimeResponseRef = useRef(false);
   useEffect(() => {
-    if (realtimeResponseStatus?.playing) {
+    const s = realtimeResponseStatus;
+    if (!s) return;
+
+    if (s.playing) {
       wasPlayingRealtimeResponseRef.current = true;
-    } else if (wasPlayingRealtimeResponseRef.current) {
+      return;
+    }
+
+    const hadStarted = wasPlayingRealtimeResponseRef.current;
+    const shouldFinalizeMic =
+      voiceInputModeRef.current === 'realtime' &&
+      realtimeAwaitingPlaybackFinalizeRef.current &&
+      (hadStarted || Boolean(s.didJustFinish));
+
+    if (shouldFinalizeMic) {
       wasPlayingRealtimeResponseRef.current = false;
-      setOrbState('idle');
-      if (voiceInputModeRef.current === 'realtime') {
-        setRealtimeOrbLabel('Listening…');
-        beginRealtimeStreamingRef.current?.();
+      finalizeRealtimeResponsePlaybackRef.current?.().catch((e) =>
+        console.warn('[realtime] finalize after playback:', e?.message ?? e)
+      );
+      return;
+    }
+
+    if (!realtimeAwaitingPlaybackFinalizeRef.current) {
+      wasPlayingRealtimeResponseRef.current = false;
+      if (voiceInputModeRef.current !== 'realtime') {
+        setOrbState('idle');
       }
     }
-  }, [realtimeResponseStatus?.playing]);
+  }, [realtimeResponseStatus]);
 
   const modeAnim = useRef(new Animated.Value(0)).current; // 0 voice, 1 text
 
@@ -1345,6 +1368,11 @@ export default function App() {
       await FileSystemLegacy.writeAsStringAsync(uri, uint8ArrayToBase64(wav), {
         encoding: FileSystemLegacy.EncodingType.Base64,
       });
+      if (realtimePlaybackFallbackTimerRef.current) {
+        clearTimeout(realtimePlaybackFallbackTimerRef.current);
+        realtimePlaybackFallbackTimerRef.current = null;
+      }
+
       await setAudioModeAsync({
         allowsRecording: false,
         playsInSilentMode: true,
@@ -1354,10 +1382,22 @@ export default function App() {
       });
       const player = realtimeResponsePlayerRef.current;
       if (!player) return;
+      try {
+        player.pause();
+      } catch (_) {}
       player.replace({ uri });
       setOrbState('speaking');
       setRealtimeOrbLabel('Speaking…');
+      realtimeAwaitingPlaybackFinalizeRef.current = true;
+      wasPlayingRealtimeResponseRef.current = false;
       player.play();
+      realtimePlaybackFallbackTimerRef.current = setTimeout(() => {
+        realtimePlaybackFallbackTimerRef.current = null;
+        if (!realtimeAwaitingPlaybackFinalizeRef.current) return;
+        if (realtimeResponsePlayerRef.current?.playing) return;
+        console.warn('[realtime] playback did not start; resetting session for mic');
+        finalizeRealtimeResponsePlaybackRef.current?.().catch(() => {});
+      }, 1500);
     };
 
     const onRealtimeReady = () => {
@@ -1444,6 +1484,11 @@ export default function App() {
     mgr.on('reconnect_failed', onReconnectFailed);
 
     return () => {
+      if (realtimePlaybackFallbackTimerRef.current) {
+        clearTimeout(realtimePlaybackFallbackTimerRef.current);
+        realtimePlaybackFallbackTimerRef.current = null;
+      }
+      realtimeAwaitingPlaybackFinalizeRef.current = false;
       if (realtimeChunkIntervalRef.current) {
         clearInterval(realtimeChunkIntervalRef.current);
         realtimeChunkIntervalRef.current = null;
@@ -1842,6 +1887,45 @@ export default function App() {
   }, [realtimeAudioRecorder]);
 
   beginRealtimeStreamingRef.current = beginRealtimeStreaming;
+
+  const finalizeRealtimeResponsePlayback = useCallback(async () => {
+    if (!realtimeAwaitingPlaybackFinalizeRef.current) return;
+    realtimeAwaitingPlaybackFinalizeRef.current = false;
+
+    if (realtimePlaybackFallbackTimerRef.current) {
+      clearTimeout(realtimePlaybackFallbackTimerRef.current);
+      realtimePlaybackFallbackTimerRef.current = null;
+    }
+
+    try {
+      const player = realtimeResponsePlayerRef.current;
+      try {
+        player?.pause?.();
+      } catch (_) {}
+      await setAudioModeAsync({
+        allowsRecording: true,
+        playsInSilentMode: true,
+        interruptionMode: 'duckOthers',
+        shouldPlayInBackground: false,
+        shouldRouteThroughEarpiece: false,
+      });
+    } catch (e) {
+      console.warn('[realtime] reset audio session after playback:', e?.message ?? e);
+    }
+
+    await new Promise((r) => setTimeout(r, 100));
+
+    if (voiceInputModeRef.current !== 'realtime' || modeRef.current !== 'voice') {
+      setOrbState('idle');
+      return;
+    }
+
+    setOrbState('idle');
+    setRealtimeOrbLabel('Listening…');
+    await beginRealtimeStreamingRef.current?.();
+  }, []);
+
+  finalizeRealtimeResponsePlaybackRef.current = finalizeRealtimeResponsePlayback;
 
   useEffect(() => {
     const canStream =
