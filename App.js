@@ -21,6 +21,7 @@ import {
 import { Ionicons } from '@expo/vector-icons';
 import * as DocumentPicker from 'expo-document-picker';
 import * as ImagePicker from 'expo-image-picker';
+import * as ImageManipulator from 'expo-image-manipulator';
 import * as Location from 'expo-location';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Constants from 'expo-constants';
@@ -919,8 +920,51 @@ export default function App() {
               ? `${visionLoc.latitude},${visionLoc.longitude}`
               : '');
 
+          let imageUri = (visionPreviewUri && String(visionPreviewUri).trim()) || '';
+          if (!imageUri) {
+            const tmpSrc = `${FileSystemLegacy.cacheDirectory || ''}vision_forensic_src_${Date.now()}.jpg`;
+            await FileSystemLegacy.writeAsStringAsync(tmpSrc, visionImageBase64, {
+              encoding: FileSystemLegacy.EncodingType.Base64,
+            });
+            imageUri = tmpSrc;
+          }
+
+          let resizeActions = [{ resize: { width: 1024 } }];
+          try {
+            const dims = await new Promise((resolve, reject) => {
+              Image.getSize(
+                imageUri,
+                (w, h) => resolve({ w, h }),
+                (err) => reject(err)
+              );
+            });
+            const maxDim = Math.max(dims.w, dims.h);
+            if (maxDim > 1024) {
+              resizeActions =
+                dims.w >= dims.h
+                  ? [{ resize: { width: 1024 } }]
+                  : [{ resize: { height: 1024 } }];
+            } else {
+              resizeActions = [];
+            }
+          } catch {
+            resizeActions = [{ resize: { width: 1024 } }];
+          }
+
+          const manipulated = await ImageManipulator.manipulateAsync(imageUri, resizeActions, {
+            compress: 0.7,
+            format: ImageManipulator.SaveFormat.JPEG,
+            base64: true,
+          });
+          const compressedBase64 = manipulated.base64;
+          if (!compressedBase64) {
+            Alert.alert('Forensic vision', 'Could not compress image. Try another photo.');
+            return;
+          }
+
           const forensicUrl = `${API_BASE}/api/vision/forensic`;
-          const b64Len = typeof visionImageBase64 === 'string' ? visionImageBase64.length : 0;
+          const b64LenOrig = typeof visionImageBase64 === 'string' ? visionImageBase64.length : 0;
+          const b64Len = compressedBase64.length;
           const approxDecodedBytes = b64Len ? Math.floor((b64Len * 3) / 4) : 0;
           console.log('[vision][forensic] target URL (full):', forensicUrl);
           console.log('[vision][forensic] API_BASE check:', {
@@ -930,7 +974,8 @@ export default function App() {
           });
           console.log('[vision][forensic] request payload summary:', {
             file_name: 'ios-camera.jpg',
-            image_base64_length: b64Len,
+            image_base64_length_original: b64LenOrig,
+            image_base64_length_compressed: b64Len,
             approx_decoded_bytes: approxDecodedBytes,
             context_len: ctx.length,
             has_tyler_location: Boolean(tylerLocationStr),
@@ -941,7 +986,7 @@ export default function App() {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-              image_base64: visionImageBase64,
+              image_base64: compressedBase64,
               context: ctx,
               ...(tylerLocationStr ? { tyler_location: tylerLocationStr } : {}),
               file_name: 'ios-camera.jpg',
@@ -1038,7 +1083,7 @@ export default function App() {
         setVisionSending(false);
       }
     },
-    [visionImageBase64, visionSending, visionForensicMode, playTTS, closeVisionModal]
+    [visionImageBase64, visionPreviewUri, visionSending, visionForensicMode, playTTS, closeVisionModal]
   );
 
   const fileVisionForensicToIntel = useCallback(async () => {
