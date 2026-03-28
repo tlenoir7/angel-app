@@ -241,6 +241,32 @@ function extractCadResultFromResponse(data, fallbackReplyText, apiBase) {
   return { design_name: design, download_urls, api_base: apiBase };
 }
 
+/**
+ * After Socket.IO delivers assistant text, detect CAD links for "View in 3D".
+ * Uses structured download_urls when present, else parses /api/cad/download/ in reply,
+ * else matches design folder and defaults to lenticular.step / lenticular.stl.
+ */
+function applyLastCadIfDetected(payload, replyText, apiBase, setLastCadResult) {
+  let cad = extractCadResultFromResponse(payload, replyText, apiBase);
+  if (!cad?.design_name) {
+    const m = String(replyText || '').match(/\/api\/cad\/download\/([^/\s]+)\//);
+    if (m) {
+      const designName = m[1];
+      cad = {
+        design_name: designName,
+        download_urls: {
+          step: `${apiBase}/api/cad/download/${designName}/lenticular.step`,
+          stl: `${apiBase}/api/cad/download/${designName}/lenticular.stl`,
+        },
+        api_base: apiBase,
+      };
+    }
+  }
+  if (cad?.design_name) {
+    setLastCadResult(cad);
+  }
+}
+
 /** Readable label from expo-location reverseGeocode first result */
 function placeNameFromGeocode(a) {
   if (!a) return '';
@@ -1216,10 +1242,7 @@ export default function App() {
           ...prev,
           { id: makeId(), role: 'assistant', content: reply },
         ]);
-        const cad = extractCadResultFromResponse(data, reply, API_BASE);
-        if (cad?.design_name) {
-          setLastCadResult(cad);
-        }
+        applyLastCadIfDetected(data, reply, API_BASE, setLastCadResult);
         if (shouldPlayTTS) {
           playTTSRef.current?.(reply);
         } else {
@@ -1262,7 +1285,12 @@ export default function App() {
     const onAngelReplyComplete = (payload) => {
       expectingResponseRef.current = false;
       setLoading(false);
-      const reply = parseAngelReply(payload) || streamingAssistantTextRef.current || '';
+      const hadStreaming = Boolean(streamingAssistantIdRef.current);
+      const streamed = streamingAssistantTextRef.current || '';
+      const parsed = parseAngelReply(payload) || '';
+      // Prefer accumulated chunks: servers often send a short `reply` without links while chunks hold the full CAD URLs.
+      const reply =
+        hadStreaming && streamed ? streamed : parsed || streamed || '';
       if (streamingAssistantIdRef.current) {
         const curId = streamingAssistantIdRef.current;
         setMessages((prev) =>
@@ -1271,10 +1299,7 @@ export default function App() {
       } else if (reply) {
         setMessages((prev) => [...prev, { id: makeId(), role: 'assistant', content: reply }]);
       }
-      const cad = extractCadResultFromResponse(payload, reply, API_BASE);
-      if (cad?.design_name) {
-        setLastCadResult(cad);
-      }
+      applyLastCadIfDetected(payload, reply, API_BASE, setLastCadResult);
       const fromVoice = lastSocketRequestWasVoiceRef.current;
       const inVoiceMode = modeRef.current === 'voice';
       const shouldPlayTTS = inVoiceMode || fromVoice;
