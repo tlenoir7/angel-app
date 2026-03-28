@@ -40,11 +40,6 @@ import {
   IOSOutputFormat,
   AudioQuality,
 } from 'expo-audio';
-import {
-  Audio as ExpoAvAudio,
-  InterruptionModeAndroid,
-  InterruptionModeIOS,
-} from 'expo-av';
 import * as FileSystemLegacy from 'expo-file-system/legacy';
 import { io } from 'socket.io-client';
 
@@ -378,10 +373,8 @@ export default function App() {
   const realtimeChunkIntervalRef = useRef(null);
   const realtimePcmSentRef = useRef(0);
   const realtimeResponsePcmRef = useRef([]);
-  /** expo-av `Sound` for Realtime assistant PCM (WAV); unloaded after each response. */
-  const realtimeAvSoundRef = useRef(null);
-  const realtimeAvFinishOnceRef = useRef(false);
-  const unloadRealtimeResponseSoundRef = useRef(() => Promise.resolve());
+  /** Latest `AudioPlayer` for Realtime assistant PCM (WAV file URI); expo-audio only (expo-av breaks SDK 55 iOS). */
+  const realtimeResponsePlayerRef = useRef(null);
   /** Latest Realtime `AudioRecorder` for socket cleanup / chunk loop. */
   const realtimeAudioRecorderRef = useRef(null);
   /** Set after `cleanupRealtimeRecording` is defined each render (socket handlers call latest cleanup). */
@@ -471,7 +464,10 @@ export default function App() {
   // SDK 55: call with no args when source is set later via replace() (avoids native ctor mismatch)
   const ttsPlayer = useAudioPlayer();
   const ttsStatus = useAudioPlayerStatus(ttsPlayer);
-  /** Realtime assistant audio uses expo-av `Sound` (unload + session reset each turn); TTS stays on expo-audio. */
+  /** Separate player for Realtime assistant PCM — expo-audio only (stable expo-av is not compatible with Expo SDK 55 native). */
+  const realtimeResponsePlayer = useAudioPlayer(null);
+  const realtimeResponseStatus = useAudioPlayerStatus(realtimeResponsePlayer);
+  realtimeResponsePlayerRef.current = realtimeResponsePlayer;
 
   const audioRecorder = useAudioRecorder(RecordingPresets.HIGH_QUALITY);
   const realtimeAudioRecorder = useAudioRecorder(REALTIME_RECORDING_OPTIONS);
@@ -491,20 +487,37 @@ export default function App() {
     }
   }, [ttsStatus?.playing]);
 
-  const unloadRealtimeResponseSound = useCallback(async () => {
-    const sound = realtimeAvSoundRef.current;
-    realtimeAvSoundRef.current = null;
-    if (!sound) return;
-    try {
-      const st = await sound.getStatusAsync();
-      if (st.isLoaded) {
-        await sound.unloadAsync();
-      }
-    } catch (e) {
-      console.warn('[realtime] expo-av Sound unload:', e?.message ?? e);
+  const wasPlayingRealtimeResponseRef = useRef(false);
+  useEffect(() => {
+    const s = realtimeResponseStatus;
+    if (!s) return;
+
+    if (s.playing) {
+      wasPlayingRealtimeResponseRef.current = true;
+      return;
     }
-  }, []);
-  unloadRealtimeResponseSoundRef.current = unloadRealtimeResponseSound;
+
+    const hadStarted = wasPlayingRealtimeResponseRef.current;
+    const shouldFinalizeMic =
+      voiceInputModeRef.current === 'realtime' &&
+      realtimeAwaitingPlaybackFinalizeRef.current &&
+      (hadStarted || Boolean(s.didJustFinish));
+
+    if (shouldFinalizeMic) {
+      wasPlayingRealtimeResponseRef.current = false;
+      finalizeRealtimeResponsePlaybackRef.current?.().catch((e) =>
+        console.warn('[realtime] finalize after playback:', e?.message ?? e)
+      );
+      return;
+    }
+
+    if (!realtimeAwaitingPlaybackFinalizeRef.current) {
+      wasPlayingRealtimeResponseRef.current = false;
+      if (voiceInputModeRef.current !== 'realtime') {
+        setOrbState('idle');
+      }
+    }
+  }, [realtimeResponseStatus]);
 
   const modeAnim = useRef(new Animated.Value(0)).current; // 0 voice, 1 text
 
@@ -1360,52 +1373,31 @@ export default function App() {
         realtimePlaybackFallbackTimerRef.current = null;
       }
 
-      await unloadRealtimeResponseSoundRef.current?.();
-      realtimeAvFinishOnceRef.current = false;
-
-      await ExpoAvAudio.setAudioModeAsync({
-        allowsRecordingIOS: false,
-        playsInSilentModeIOS: true,
-        staysActiveInBackground: true,
-        interruptionModeIOS: InterruptionModeIOS.DuckOthers,
-        interruptionModeAndroid: InterruptionModeAndroid.DuckOthers,
-        shouldDuckAndroid: true,
-        playThroughEarpieceAndroid: false,
+      await setAudioModeAsync({
+        allowsRecording: false,
+        playsInSilentMode: true,
+        interruptionMode: 'duckOthers',
+        shouldPlayInBackground: false,
+        shouldRouteThroughEarpiece: false,
       });
-
+      const player = realtimeResponsePlayerRef.current;
+      if (!player) return;
+      try {
+        player.pause();
+      } catch (_) {}
+      player.replace({ uri });
       setOrbState('speaking');
       setRealtimeOrbLabel('Speaking…');
       realtimeAwaitingPlaybackFinalizeRef.current = true;
-
-      const { sound } = await ExpoAvAudio.Sound.createAsync(
-        { uri },
-        { shouldPlay: false },
-        (status) => {
-          if (!status.isLoaded || !status.didJustFinish) return;
-          if (realtimeAvFinishOnceRef.current) return;
-          realtimeAvFinishOnceRef.current = true;
-          finalizeRealtimeResponsePlaybackRef.current?.().catch((e) =>
-            console.warn('[realtime] finalize on didJustFinish:', e?.message ?? e)
-          );
-        }
-      );
-      realtimeAvSoundRef.current = sound;
-      await sound.playAsync();
+      wasPlayingRealtimeResponseRef.current = false;
+      player.play();
 
       realtimePlaybackFallbackTimerRef.current = setTimeout(() => {
         realtimePlaybackFallbackTimerRef.current = null;
         if (!realtimeAwaitingPlaybackFinalizeRef.current) return;
-        (async () => {
-          try {
-            const snd = realtimeAvSoundRef.current;
-            if (snd) {
-              const st = await snd.getStatusAsync();
-              if (st.isLoaded && st.isPlaying) return;
-            }
-          } catch (_) {}
-          console.warn('[realtime] playback did not start; resetting session for mic');
-          finalizeRealtimeResponsePlaybackRef.current?.().catch(() => {});
-        })();
+        if (realtimeResponsePlayerRef.current?.playing) return;
+        console.warn('[realtime] playback did not start; resetting session for mic');
+        finalizeRealtimeResponsePlaybackRef.current?.().catch(() => {});
       }, 1500);
     };
 
@@ -1498,7 +1490,6 @@ export default function App() {
         realtimePlaybackFallbackTimerRef.current = null;
       }
       realtimeAwaitingPlaybackFinalizeRef.current = false;
-      void unloadRealtimeResponseSoundRef.current?.();
       if (realtimeChunkIntervalRef.current) {
         clearInterval(realtimeChunkIntervalRef.current);
         realtimeChunkIntervalRef.current = null;
@@ -1845,14 +1836,12 @@ export default function App() {
         return;
       }
 
-      await ExpoAvAudio.setAudioModeAsync({
-        allowsRecordingIOS: true,
-        interruptionModeIOS: InterruptionModeIOS.DuckOthers,
-        playsInSilentModeIOS: true,
-        staysActiveInBackground: false,
-        interruptionModeAndroid: InterruptionModeAndroid.DuckOthers,
-        shouldDuckAndroid: true,
-        playThroughEarpieceAndroid: false,
+      await setAudioModeAsync({
+        allowsRecording: true,
+        playsInSilentMode: true,
+        interruptionMode: 'duckOthers',
+        shouldPlayInBackground: false,
+        shouldRouteThroughEarpiece: false,
       });
 
       if (voiceInputModeRef.current !== 'realtime' || modeRef.current !== 'voice') return;
@@ -1911,18 +1900,19 @@ export default function App() {
     if (!hadAwaiting) return;
 
     try {
-      await unloadRealtimeResponseSound();
-      await ExpoAvAudio.setAudioModeAsync({
-        allowsRecordingIOS: true,
-        interruptionModeIOS: InterruptionModeIOS.DuckOthers,
-        playsInSilentModeIOS: true,
-        staysActiveInBackground: false,
-        interruptionModeAndroid: InterruptionModeAndroid.DuckOthers,
-        shouldDuckAndroid: true,
-        playThroughEarpieceAndroid: false,
+      const player = realtimeResponsePlayerRef.current;
+      try {
+        player?.pause?.();
+      } catch (_) {}
+      await setAudioModeAsync({
+        allowsRecording: true,
+        playsInSilentMode: true,
+        interruptionMode: 'duckOthers',
+        shouldPlayInBackground: false,
+        shouldRouteThroughEarpiece: false,
       });
     } catch (e) {
-      console.warn('[realtime] reset audio session after playback (expo-av):', e?.message ?? e);
+      console.warn('[realtime] reset audio session after playback:', e?.message ?? e);
     }
 
     await new Promise((r) => setTimeout(r, 100));
@@ -1935,7 +1925,7 @@ export default function App() {
     setOrbState('idle');
     setRealtimeOrbLabel('Listening…');
     await beginRealtimeStreamingRef.current?.();
-  }, [unloadRealtimeResponseSound]);
+  }, []);
 
   finalizeRealtimeResponsePlaybackRef.current = finalizeRealtimeResponsePlayback;
 
