@@ -249,9 +249,16 @@ function extractCadResultFromResponse(data, fallbackReplyText, apiBase) {
 function applyLastCadIfDetected(payload, replyText, apiBase, setLastCadResult) {
   let cad = extractCadResultFromResponse(payload, replyText, apiBase);
   if (!cad?.design_name) {
-    const m = String(replyText || '').match(/\/api\/cad\/download\/([^/\s]+)\//);
-    if (m) {
-      const designName = m[1];
+    const text = String(replyText || '');
+    const m = text.match(
+      /\/api\/cad\/download\/([^/\s]+)\/|\/tmp\/angel_cad\/[^/]+\/([^/\s]+)\//
+    );
+    let designName = m ? m[1] || m[2] : '';
+    if (!designName) {
+      const nameMatch = text.match(/angel_cad\/[^/]+\/([^/\s]+)\//);
+      if (nameMatch) designName = nameMatch[1];
+    }
+    if (designName) {
       cad = {
         design_name: designName,
         download_urls: {
