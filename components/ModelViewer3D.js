@@ -9,6 +9,7 @@ import {
   Text,
   View,
 } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { GLView } from 'expo-gl';
 import { Renderer } from 'expo-three';
 import * as THREE from 'three';
@@ -41,15 +42,23 @@ function boundsDims(bounds) {
  * Full-screen 3D viewer modal.
  * Props: { designName, apiBase, onClose }
  */
+const ROTATION_SENS = 0.01 * 0.5; // 0.5× previous sensitivity
+const ANGULAR_DAMP = 0.88; // per-frame velocity decay (smoother than instant snap)
+const MAX_TRIANGLES = 90000; // skip faces when mesh is huge (keeps ~60fps)
+
 export default function ModelViewer3D({ designName, apiBase, onClose }) {
+  const insets = useSafeAreaInsets();
   const [loading, setLoading] = useState(true);
   const [meshJson, setMeshJson] = useState(null);
   const [error, setError] = useState('');
   const [hintVisible, setHintVisible] = useState(true);
-  const [interacting, setInteracting] = useState(false);
 
   const glRef = useRef(null);
   const rafRef = useRef(null);
+  /** Ref mirror: GL animate loop must not read stale `interacting` state. */
+  const interactingRef = useRef(false);
+  /** Angular velocity applied once per rAF; smoothed with damping. */
+  const angularVelRef = useRef({ theta: 0, phi: 0 });
   const threeRef = useRef({
     scene: null,
     camera: null,
@@ -105,9 +114,10 @@ export default function ModelViewer3D({ designName, apiBase, onClose }) {
       onStartShouldSetPanResponder: () => true,
       onMoveShouldSetPanResponder: () => true,
       onPanResponderGrant: (evt) => {
-        setInteracting(true);
+        interactingRef.current = true;
         const touches = evt?.nativeEvent?.touches || [];
         if (touches.length >= 2) {
+          angularVelRef.current = { theta: 0, phi: 0 };
           const a = touches[0];
           const b = touches[1];
           lastDist = Math.hypot(a.pageX - b.pageX, a.pageY - b.pageY);
@@ -123,6 +133,7 @@ export default function ModelViewer3D({ designName, apiBase, onClose }) {
         if (!st?.camera) return;
 
         if (touches.length >= 2) {
+          angularVelRef.current = { theta: 0, phi: 0 };
           const a = touches[0];
           const b = touches[1];
           const dist = Math.hypot(a.pageX - b.pageX, a.pageY - b.pageY);
@@ -131,7 +142,7 @@ export default function ModelViewer3D({ designName, apiBase, onClose }) {
           // Pinch zoom
           if (lastDist > 0) {
             const delta = dist - lastDist;
-            st.radius = clamp(st.radius - delta * 0.6, 40, 5000);
+            st.radius = clamp(st.radius - delta * 0.45, 40, 5000);
           }
           lastDist = dist;
 
@@ -139,22 +150,23 @@ export default function ModelViewer3D({ designName, apiBase, onClose }) {
           if (lastMid) {
             const dx = mid.x - lastMid.x;
             const dy = mid.y - lastMid.y;
-            const panScale = st.radius * 0.002;
+            const panScale = st.radius * 0.0018;
             st.pan.add(new THREE.Vector3(-dx * panScale, dy * panScale, 0));
           }
           lastMid = mid;
           return;
         }
 
-        // One-finger rotate
-        st.theta += gesture.dx * 0.01;
-        st.phi = clamp(st.phi + gesture.dy * 0.01, 0.15, Math.PI - 0.15);
+        // One-finger rotate: accumulate velocity; rAF loop integrates + damps (smoother)
+        const av = angularVelRef.current;
+        av.theta += gesture.dx * ROTATION_SENS;
+        av.phi += gesture.dy * ROTATION_SENS;
       },
       onPanResponderRelease: () => {
-        setInteracting(false);
+        interactingRef.current = false;
       },
       onPanResponderTerminate: () => {
-        setInteracting(false);
+        interactingRef.current = false;
       },
     });
   }, []);
@@ -183,17 +195,24 @@ export default function ModelViewer3D({ designName, apiBase, onClose }) {
       const faces = meshJson.faces || [];
       const normals = meshJson.normals || [];
 
+      const triCount = Math.floor(faces.length / 3);
+      const triSkip = triCount > MAX_TRIANGLES ? Math.ceil(triCount / MAX_TRIANGLES) : 1;
+      const faceStride = 3 * triSkip;
+
+      const outTris = Math.ceil(faces.length / faceStride);
       const geometry = new THREE.BufferGeometry();
-      const pos = new Float32Array(faces.length * 3);
-      const nor = new Float32Array(faces.length * 3);
-      for (let f = 0; f < faces.length; f += 3) {
+      const pos = new Float32Array(outTris * 9);
+      const nor = new Float32Array(outTris * 9);
+      let out = 0;
+      for (let f = 0; f < faces.length; f += faceStride) {
         const i0 = faces[f + 0];
         const i1 = faces[f + 1];
         const i2 = faces[f + 2];
+        if (i0 === undefined || i1 === undefined || i2 === undefined) break;
         const v0 = verts[i0] || [0, 0, 0];
         const v1 = verts[i1] || [0, 0, 0];
         const v2 = verts[i2] || [0, 0, 0];
-        const base = f * 3;
+        const base = out * 9;
         pos[base + 0] = v0[0];
         pos[base + 1] = v0[1];
         pos[base + 2] = v0[2];
@@ -204,7 +223,7 @@ export default function ModelViewer3D({ designName, apiBase, onClose }) {
         pos[base + 7] = v2[1];
         pos[base + 8] = v2[2];
 
-        const fn = normals[f / 3] || null;
+        const fn = normals[Math.floor(f / 3)] || null;
         if (fn) {
           for (let k = 0; k < 9; k += 3) {
             nor[base + k + 0] = fn[0];
@@ -212,10 +231,13 @@ export default function ModelViewer3D({ designName, apiBase, onClose }) {
             nor[base + k + 2] = fn[2];
           }
         }
+        out += 1;
       }
-      geometry.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-      if (nor.some((x) => x !== 0)) {
-        geometry.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
+      const posUsed = pos.subarray(0, out * 9);
+      const norUsed = nor.subarray(0, out * 9);
+      geometry.setAttribute('position', new THREE.BufferAttribute(posUsed, 3));
+      if (norUsed.some((x) => x !== 0)) {
+        geometry.setAttribute('normal', new THREE.BufferAttribute(norUsed, 3));
       } else {
         geometry.computeVertexNormals();
       }
@@ -262,7 +284,13 @@ export default function ModelViewer3D({ designName, apiBase, onClose }) {
       const st = threeRef.current;
       if (!st?.renderer || !st?.scene || !st?.camera) return;
 
-      if (!interacting) {
+      const av = angularVelRef.current;
+      st.theta += av.theta;
+      st.phi = clamp(st.phi + av.phi, 0.15, Math.PI - 0.15);
+      av.theta *= ANGULAR_DAMP;
+      av.phi *= ANGULAR_DAMP;
+
+      if (!interactingRef.current) {
         st.theta += 0.003; // slow auto-rotate
       }
 
@@ -297,10 +325,12 @@ export default function ModelViewer3D({ designName, apiBase, onClose }) {
     } catch (_) {}
   };
 
+  const headerPadTop = insets.top + 10;
+
   return (
     <Modal visible transparent animationType="fade" onRequestClose={onClose}>
       <View style={styles.wrap} {...panResponder.panHandlers}>
-        <View style={styles.header}>
+        <View style={[styles.header, { paddingTop: headerPadTop }]}>
           <Pressable onPress={shareStl} style={styles.headerBtn} hitSlop={10}>
             <Text style={styles.headerBtnText}>Share</Text>
           </Pressable>
@@ -311,6 +341,12 @@ export default function ModelViewer3D({ designName, apiBase, onClose }) {
             <Text style={styles.headerBtnText}>Close</Text>
           </Pressable>
         </View>
+
+        {hintVisible ? (
+          <View style={[styles.hintBar, { paddingLeft: 14 + insets.left, paddingRight: 14 + insets.right }]}>
+            <Text style={styles.hint}>Rotate to inspect</Text>
+          </View>
+        ) : null}
 
         <View style={styles.viewer}>
           {loading ? (
@@ -327,11 +363,10 @@ export default function ModelViewer3D({ designName, apiBase, onClose }) {
           )}
         </View>
 
-        <View style={styles.footer}>
+        <View style={[styles.footer, { paddingBottom: Math.max(insets.bottom, 8) }]}>
           <Text style={styles.dims}>
             {`W ${fmtMm(dims.dx)}   H ${fmtMm(dims.dy)}   D ${fmtMm(dims.dz)}`}
           </Text>
-          {hintVisible ? <Text style={styles.hint}>Rotate to inspect</Text> : null}
         </View>
       </View>
     </Modal>
@@ -344,13 +379,20 @@ const styles = StyleSheet.create({
     backgroundColor: '#050509',
   },
   header: {
-    height: 56,
+    minHeight: 48,
+    paddingBottom: 10,
     paddingHorizontal: 14,
     borderBottomWidth: 1,
     borderBottomColor: '#111827',
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
+  },
+  hintBar: {
+    paddingVertical: 8,
+    borderBottomWidth: 1,
+    borderBottomColor: '#111827',
+    backgroundColor: '#050509',
   },
   title: { color: '#E5E7EB', fontSize: 16, fontWeight: '700', flex: 1, textAlign: 'center' },
   headerBtn: { paddingVertical: 8, paddingHorizontal: 10, minWidth: 60 },
@@ -370,6 +412,6 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
   },
   dims: { color: '#9CA3AF', fontSize: 12, fontWeight: '600' },
-  hint: { color: '#E5E7EB', fontSize: 12, fontWeight: '700' },
+  hint: { color: '#E5E7EB', fontSize: 12, fontWeight: '700', textAlign: 'center' },
 });
 
