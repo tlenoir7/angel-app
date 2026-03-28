@@ -43,6 +43,13 @@ import * as FileSystemLegacy from 'expo-file-system/legacy';
 import { io } from 'socket.io-client';
 
 const API_BASE = 'https://web-production-0166f.up.railway.app';
+/** Must match Railway deploy; forensic + file-read use this host. */
+const EXPECTED_RAILWAY_API_BASE = 'https://web-production-0166f.up.railway.app';
+console.log('[angel] API_BASE configured:', {
+  API_BASE,
+  expected: EXPECTED_RAILWAY_API_BASE,
+  matchesProduction: API_BASE === EXPECTED_RAILWAY_API_BASE,
+});
 /** Default Engine.IO path; handshake uses e.g. wss://host/socket.io/?EIO=4&transport=websocket */
 const SOCKET_IO_PATH = '/socket.io';
 const PUSH_REGISTERED_KEY = 'angel_push_token_registered';
@@ -194,6 +201,8 @@ function parseAngelReply(data) {
     data?.response ??
     data?.text ??
     data?.message ??
+    data?.summary ??
+    data?.extracted_text ??
     ''
   );
 }
@@ -910,7 +919,25 @@ export default function App() {
               ? `${visionLoc.latitude},${visionLoc.longitude}`
               : '');
 
-          const res = await fetch(`${API_BASE}/api/vision/forensic`, {
+          const forensicUrl = `${API_BASE}/api/vision/forensic`;
+          const b64Len = typeof visionImageBase64 === 'string' ? visionImageBase64.length : 0;
+          const approxDecodedBytes = b64Len ? Math.floor((b64Len * 3) / 4) : 0;
+          console.log('[vision][forensic] target URL (full):', forensicUrl);
+          console.log('[vision][forensic] API_BASE check:', {
+            API_BASE,
+            expected: EXPECTED_RAILWAY_API_BASE,
+            matchesExpected: API_BASE === EXPECTED_RAILWAY_API_BASE,
+          });
+          console.log('[vision][forensic] request payload summary:', {
+            file_name: 'ios-camera.jpg',
+            image_base64_length: b64Len,
+            approx_decoded_bytes: approxDecodedBytes,
+            context_len: ctx.length,
+            has_tyler_location: Boolean(tylerLocationStr),
+          });
+          console.log('[vision][forensic] sending POST request now…');
+
+          const res = await fetch(forensicUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -920,10 +947,31 @@ export default function App() {
               file_name: 'ios-camera.jpg',
             }),
           });
-          const data = await res.json().catch(() => ({}));
-          console.log('[vision] /api/vision/forensic response:', { status: res.status, data });
+
+          console.log('[vision][forensic] response HTTP status:', res.status, res.statusText, 'ok:', res.ok);
+
+          const data = await res.json().catch((parseErr) => {
+            console.error('[vision][forensic] response JSON parse failed (full):', {
+              message: parseErr?.message ?? String(parseErr),
+              name: parseErr?.name,
+              stack: parseErr?.stack,
+              full: parseErr,
+            });
+            return {};
+          });
+          console.log('[vision][forensic] response body keys:', data && typeof data === 'object' ? Object.keys(data) : typeof data, {
+            status: res.status,
+            ok_field: data?.ok,
+            error_field: data?.error,
+          });
           if (!res.ok || data.ok === false) {
             const err = data.error || `HTTP ${res.status}`;
+            console.error('[vision][forensic] request failed or ok=false:', {
+              httpStatus: res.status,
+              dataOk: data?.ok,
+              error: err,
+              fullData: data,
+            });
             Alert.alert('Forensic vision', String(err));
             return;
           }
@@ -965,7 +1013,18 @@ export default function App() {
           setOrbState('idle');
         }
       } catch (e) {
-        console.warn('[vision] request failed:', e?.message ?? e);
+        console.error('[vision] request failed (full details):', {
+          message: e?.message ?? String(e),
+          name: e?.name,
+          stack: e?.stack,
+          cause: e?.cause,
+          full: e,
+          API_BASE,
+          urlAttempted: visionForensicMode
+            ? `${API_BASE}/api/vision/forensic`
+            : `${API_BASE}/api/vision`,
+          visionForensicMode,
+        });
         setMessages((prev) => [
           ...prev,
           {
@@ -1386,13 +1445,23 @@ export default function App() {
       try {
         if (attachSnap.kind === 'document') {
           const filesReadUrl = `${API_BASE}/api/files/read`;
+          const b64Len =
+            typeof attachSnap.base64 === 'string' ? attachSnap.base64.length : 0;
+          const approxDecodedBytes = b64Len ? Math.floor((b64Len * 3) / 4) : 0;
+          console.log('[attach][files/read] target URL (full):', filesReadUrl);
+          console.log('[attach][files/read] API_BASE check:', {
+            API_BASE,
+            expected: EXPECTED_RAILWAY_API_BASE,
+            matchesExpected: API_BASE === EXPECTED_RAILWAY_API_BASE,
+          });
           console.log('[attach] document upload start', {
             apiBase: API_BASE,
             endpoint: filesReadUrl,
             isLocalhost: /localhost|127\.0\.0\.1/i.test(API_BASE),
             fileName: attachSnap.fileName,
+            fileSizeApproxBytes: approxDecodedBytes,
             mimeType: attachSnap.mimeType || '(unknown)',
-            base64Length: typeof attachSnap.base64 === 'string' ? attachSnap.base64.length : 0,
+            base64Length: b64Len,
           });
           const body = {
             file_content: attachSnap.base64,
@@ -1414,7 +1483,7 @@ export default function App() {
             file_content_length: fcStr.length,
             file_content_prefix: fcStr.slice(0, 120),
           });
-          console.log('[attach] /api/files/read sending request now');
+          console.log('[attach] /api/files/read sending POST request now…');
           const res = await fetch(filesReadUrl, {
             method: 'POST',
             headers: {
@@ -1423,6 +1492,7 @@ export default function App() {
             },
             body: JSON.stringify(body),
           });
+          console.log('[attach] /api/files/read response HTTP status:', res.status, res.statusText, 'ok:', res.ok);
           const rawText = await res.text();
           console.log('[attach] /api/files/read RAW response', {
             status: res.status,
@@ -1443,13 +1513,21 @@ export default function App() {
             hasReply: !!parseAngelReply(data),
             backendError: data?.error ?? null,
           });
-          const reply = parseAngelReply(data) || (typeof data === 'string' ? data : '');
-          const errMsg = data?.error != null ? String(data.error) : '';
-          const assistantText =
-            reply ||
-            (!res.ok && errMsg ? errMsg : '') ||
-            (!res.ok ? `HTTP ${res.status}` : '') ||
-            'Sorry, I couldn’t read that file.';
+          let assistantText;
+          if (data?.ok && data?.summary) {
+            const keyFindings = Array.isArray(data.key_findings)
+              ? data.key_findings.map((f) => `• ${f}`).join('\n')
+              : '';
+            assistantText = `📄 ${data.file_type_detected || 'File'} analyzed\n\n${data.summary}${keyFindings ? '\n\n**Key findings:**\n' + keyFindings : ''}`;
+          } else {
+            const reply = parseAngelReply(data) || (typeof data === 'string' ? data : '');
+            const errMsg = data?.error != null ? String(data.error) : '';
+            assistantText =
+              reply ||
+              (!res.ok && errMsg ? errMsg : '') ||
+              (!res.ok ? `HTTP ${res.status}` : '') ||
+              'Sorry, I couldn’t read that file.';
+          }
           setMessages((prev) => [
             ...prev,
             {
@@ -1459,18 +1537,42 @@ export default function App() {
             },
           ]);
         } else {
+          const visionAttachUrl = `${API_BASE}/api/vision`;
+          const imgB64Len =
+            typeof attachSnap.base64 === 'string' ? attachSnap.base64.length : 0;
+          const approxImgBytes = imgB64Len ? Math.floor((imgB64Len * 3) / 4) : 0;
+          console.log('[attach][vision] target URL (full):', visionAttachUrl);
+          console.log('[attach][vision] API_BASE check:', {
+            API_BASE,
+            expected: EXPECTED_RAILWAY_API_BASE,
+            matchesExpected: API_BASE === EXPECTED_RAILWAY_API_BASE,
+          });
+          console.log('[attach][vision] sending POST (library image):', {
+            fileName: attachSnap.fileName,
+            approx_decoded_bytes: approxImgBytes,
+            base64_length: imgB64Len,
+          });
           const visionBody = {
             image: attachSnap.base64,
             question: messageText,
             device: 'ios',
           };
           if (locField) visionBody.location = locField;
-          const res = await fetch(`${API_BASE}/api/vision`, {
+          const res = await fetch(visionAttachUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(visionBody),
           });
-          const data = await res.json().catch(() => ({}));
+          console.log('[attach][vision] response HTTP status:', res.status, res.statusText, 'ok:', res.ok);
+          const data = await res.json().catch((parseErr) => {
+            console.error('[attach][vision] JSON parse failed (full):', {
+              message: parseErr?.message ?? String(parseErr),
+              name: parseErr?.name,
+              stack: parseErr?.stack,
+              full: parseErr,
+            });
+            return {};
+          });
           console.log('[attach] /api/vision (library) response:', { status: res.status, data });
           const reply = parseAngelReply(data) || (typeof data === 'string' ? data : '');
           setMessages((prev) => [
@@ -1488,10 +1590,17 @@ export default function App() {
           message: e?.message ?? String(e),
           name: e?.name,
           stack: e?.stack,
+          cause: e?.cause,
           full: e,
           apiBase: API_BASE,
+          expectedApiBase: EXPECTED_RAILWAY_API_BASE,
+          apiBaseMatchesExpected: API_BASE === EXPECTED_RAILWAY_API_BASE,
           endpoint:
             attachSnap?.kind === 'document' ? `${API_BASE}/api/files/read` : `${API_BASE}/api/vision`,
+          attachKind: attachSnap?.kind,
+          fileName: attachSnap?.fileName,
+          base64Length:
+            typeof attachSnap?.base64 === 'string' ? attachSnap.base64.length : 0,
         });
         console.warn('[attach] upload failed:', e?.message ?? e);
         setMessages((prev) => [
