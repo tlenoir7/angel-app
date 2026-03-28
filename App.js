@@ -241,36 +241,76 @@ function extractCadResultFromResponse(data, fallbackReplyText, apiBase) {
   return { design_name: design, download_urls, api_base: apiBase };
 }
 
+const CAD_DESIGN_WORD_RE =
+  /\b(disk|disc|fuselage|nozzle|airfoil|sphere|cylinder|lenticular|airframe|wing|nacelle|propeller|fin|canard|payload)\b/i;
+
+/** Reply text suggests Angel just produced CAD (triggers non-blocking /api/cad/list refresh). */
+function replySuggestsCadGeneration(text) {
+  const t = String(text || '');
+  const hasStep = /\bSTEP\b/i.test(t);
+  const hasStl = /\bSTL\b/i.test(t);
+  if (hasStep && hasStl) return true;
+  if (/files\s+ready|generated|\bbuilt\b/i.test(t)) return true;
+  return CAD_DESIGN_WORD_RE.test(t);
+}
+
+/** Design folder name from paths in the reply (optional hint when calling /api/cad/list). */
+function pathDesignNameFromReply(text) {
+  const t = String(text || '');
+  const m = t.match(/\/api\/cad\/download\/([^/\s]+)\/|\/tmp\/angel_cad\/[^/]+\/([^/\s]+)\//);
+  if (m) return (m[1] || m[2] || '').trim();
+  const nameMatch = t.match(/angel_cad\/[^/]+\/([^/\s]+)\//);
+  return nameMatch ? String(nameMatch[1] || '').trim() : '';
+}
+
 /**
- * After Socket.IO delivers assistant text, detect CAD links for "View in 3D".
- * Uses structured download_urls when present, else parses /api/cad/download/ in reply,
- * else matches design folder and defaults to lenticular.step / lenticular.stl.
+ * Fetches /api/cad/list and sets last CAD from API file names (non-blocking; errors ignored).
+ * If preferredDesignName matches an entry, use that; otherwise use the last design in the list.
+ */
+async function fetchLatestCadFromList(apiBase, setLastCadResult, preferredDesignName) {
+  try {
+    const cadListRes = await fetch(`${apiBase}/api/cad/list`);
+    const cadListData = await cadListRes.json().catch(() => ({}));
+    const designs = cadListData.designs || [];
+    if (!designs.length) return;
+    let picked = designs[designs.length - 1];
+    const pref = (preferredDesignName || '').trim();
+    if (pref) {
+      const byName = designs.find((d) => d && String(d.design_name || '').trim() === pref);
+      if (byName) picked = byName;
+    }
+    const dn = String(picked.design_name || '').trim();
+    const files = Array.isArray(picked.files) ? picked.files : [];
+    const stepFile = files.find((f) => typeof f === 'string' && f.toLowerCase().endsWith('.step'));
+    const stlFile = files.find((f) => typeof f === 'string' && f.toLowerCase().endsWith('.stl'));
+    if (!dn || (!stepFile && !stlFile)) return;
+    const download_urls = {};
+    if (stepFile) download_urls.step = `${apiBase}/api/cad/download/${dn}/${stepFile}`;
+    if (stlFile) download_urls.stl = `${apiBase}/api/cad/download/${dn}/${stlFile}`;
+    setLastCadResult({
+      design_name: dn,
+      download_urls,
+      api_base: apiBase,
+    });
+  } catch (_) {}
+}
+
+/**
+ * After assistant text arrives, set "View in 3D" from structured data, parsed URLs, or /api/cad/list.
  */
 function applyLastCadIfDetected(payload, replyText, apiBase, setLastCadResult) {
-  let cad = extractCadResultFromResponse(payload, replyText, apiBase);
-  if (!cad?.design_name) {
-    const text = String(replyText || '');
-    const m = text.match(
-      /\/api\/cad\/download\/([^/\s]+)\/|\/tmp\/angel_cad\/[^/]+\/([^/\s]+)\//
-    );
-    let designName = m ? m[1] || m[2] : '';
-    if (!designName) {
-      const nameMatch = text.match(/angel_cad\/[^/]+\/([^/\s]+)\//);
-      if (nameMatch) designName = nameMatch[1];
-    }
-    if (designName) {
-      cad = {
-        design_name: designName,
-        download_urls: {
-          step: `${apiBase}/api/cad/download/${designName}/lenticular.step`,
-          stl: `${apiBase}/api/cad/download/${designName}/lenticular.stl`,
-        },
-        api_base: apiBase,
-      };
-    }
-  }
+  const cad = extractCadResultFromResponse(payload, replyText, apiBase);
   if (cad?.design_name) {
     setLastCadResult(cad);
+    return;
+  }
+
+  const text = String(replyText || '');
+  const pathDesign = pathDesignNameFromReply(text);
+  const keywordCad = replySuggestsCadGeneration(text);
+
+  if (keywordCad || pathDesign) {
+    void fetchLatestCadFromList(apiBase, setLastCadResult, pathDesign || null);
   }
 }
 
@@ -1790,10 +1830,7 @@ export default function App() {
         content: reply || 'Sorry, I couldn’t process that.',
       };
       setMessages((prev) => [...prev, assistantMsg]);
-      const cad = extractCadResultFromResponse(data, reply, API_BASE);
-      if (cad?.design_name) {
-        setLastCadResult(cad);
-      }
+      applyLastCadIfDetected(data, reply, API_BASE, setLastCadResult);
       /* Text mode: show reply only, no TTS */
     } catch (e) {
       setMessages((prev) => [
